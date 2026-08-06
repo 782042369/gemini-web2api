@@ -67,6 +67,32 @@ class GeminiHandler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, ValueError):
             return None
 
+    def _read_request_body(self) -> bytes:
+        transfer_encoding = self.headers.get("Transfer-Encoding", "")
+        if "chunked" in transfer_encoding.lower():
+            chunks = []
+            while True:
+                size_line = self.rfile.readline()
+                if not size_line:
+                    break
+                size_text = size_line.split(b";", 1)[0].strip()
+                try:
+                    size = int(size_text, 16)
+                except ValueError:
+                    raise ValueError("invalid chunked request body")
+                if size == 0:
+                    while True:
+                        trailer = self.rfile.readline()
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                chunks.append(self.rfile.read(size))
+                self.rfile.read(2)
+            return b"".join(chunks)
+
+        length = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(length) if length else b""
+
     def _authorized(self):
         keys = CONFIG.get("api_keys") or []
         if not keys:
@@ -122,8 +148,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length) if length else b""
+            body = self._read_request_body()
             if self.path == "/v1/chat/completions":
                 self._handle_chat(body)
             elif self.path == "/v1/responses":
