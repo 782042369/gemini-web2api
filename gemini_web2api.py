@@ -224,7 +224,7 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     """Send prompt to Gemini StreamGenerate with retry."""
     inner = [None] * 80
     if file_refs:
-        refs = [[None, None, ref] for ref in file_refs]
+        refs = [[[ref], "image.png"] for ref in file_refs]  # [[url], filename] per HanaokaYuzu format
         inner[0] = [prompt, 0, None, refs, None, None, 0]
     else:
         inner[0] = [prompt, 0, None, None, None, None, 0]
@@ -315,7 +315,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     """Send prompt and yield incremental text deltas using httpx streaming."""
     inner = [None] * 80
     if file_refs:
-        refs = [[None, None, ref] for ref in file_refs]
+        refs = [[[ref], "image.png"] for ref in file_refs]  # [[url], filename] per HanaokaYuzu format
         inner[0] = [prompt, 0, None, refs, None, None, 0]
     else:
         inner[0] = [prompt, 0, None, None, None, None, 0]

@@ -8,6 +8,8 @@ import urllib.parse
 import ssl
 import os
 import hashlib
+import random
+import threading
 
 try:
     import httpx
@@ -18,8 +20,21 @@ except ImportError:
 from .config import CONFIG
 
 _ssl_ctx = None
-_cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
+
+# Upstream concurrency cap (max_concurrent_requests config; 0 = unlimited).
+_upstream_semaphore = None
+_upstream_sema_lock = threading.Lock()
+
+# Cookie pool: multiple Google accounts (cookie files) rotated per request.
+_cookie_caches = {}                 # path -> {"str", "sapisid", "auth_user", "mtime"}
+_active_cookie = threading.local()  # per-request selected cookie slot
+_round_robin = {"i": 0}
+_round_robin_lock = threading.Lock()
+
+# In-flight coalescing: identical concurrent generate() calls share one upstream request.
+_inflight = {}
+_inflight_lock = threading.Lock()
 
 
 def log(msg: str):
@@ -40,35 +55,91 @@ def _get_httpx_client():
     global _httpx_client
     if _httpx_client is None and HAS_HTTPX:
         proxy = CONFIG.get("proxy")
-        transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+        limits = httpx.Limits(max_connections=64, max_keepalive_connections=16)
+        transport = httpx.HTTPTransport(proxy=proxy, limits=limits) if proxy else None
+        _httpx_client = httpx.Client(
+            transport=transport, timeout=CONFIG["request_timeout_sec"],
+            verify=True, limits=limits,
+        )
     return _httpx_client
 
 
+def _cookie_paths() -> list:
+    """All configured cookie file paths (cookie_files pool + legacy cookie_file)."""
+    paths = []
+    for p in list(CONFIG.get("cookie_files") or []) + [CONFIG.get("cookie_file")]:
+        if p and p not in paths:
+            paths.append(p)
+    return paths
+
+
+def pick_next_cookie():
+    """Pick the next cookie slot (round-robin) for the current request thread.
+
+    Called once per incoming HTTP request; every upstream call made on this
+    thread (image uploads + generation, including retries) then uses the same
+    Google account. With a single cookie configured this is a no-op.
+    """
+    _active_cookie.auth_user = None
+    paths = _cookie_paths()
+    if len(paths) <= 1:
+        _active_cookie.path = paths[0] if paths else None
+        return
+    with _round_robin_lock:
+        idx = _round_robin["i"] % len(paths)
+        _round_robin["i"] += 1
+    _active_cookie.path = paths[idx]
+
+
+def _active_cookie_path():
+    return getattr(_active_cookie, "path", None) or CONFIG.get("cookie_file")
+
+
+def _active_auth_user():
+    au = getattr(_active_cookie, "auth_user", None)
+    if au is None:
+        au = CONFIG.get("auth_user")
+    return au
+
+
 def load_cookie() -> tuple:
-    """Load cookie from file with mtime-based caching."""
-    cookie_file = CONFIG.get("cookie_file")
+    """Load the request's cookie from file with mtime-based caching.
+
+    Supports a pool of cookie files (see pick_next_cookie). The JSON cookie
+    format may carry a per-account "auth_user" override.
+    """
+    cookie_file = _active_cookie_path()
     if not cookie_file or not os.path.exists(cookie_file):
         return "", None
+    cache = _cookie_caches.get(cookie_file)
     try:
         mtime = os.path.getmtime(cookie_file)
-        if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
-            return _cookie_cache["str"], _cookie_cache["sapisid"]
+        if cache and mtime == cache["mtime"] and cache["str"]:
+            _active_cookie.auth_user = cache.get("auth_user")
+            return cache["str"], cache["sapisid"]
         with open(cookie_file, "r") as f:
             content = f.read().strip()
+        auth_user = None
         if content.startswith("{"):
             data = json.loads(content)
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
+            auth_user = data.get("auth_user")
         else:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
             sapisid = pairs.get("SAPISID", "")
-        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
+        _cookie_caches[cookie_file] = {
+            "str": cookie_str, "sapisid": sapisid or None,
+            "auth_user": auth_user, "mtime": mtime,
+        }
+        _active_cookie.auth_user = auth_user
         return cookie_str, sapisid if sapisid else None
     except Exception as e:
         log(f"Cookie load error: {e}")
-        return _cookie_cache["str"], _cookie_cache["sapisid"]
+        prev = _cookie_caches.get(cookie_file) or {}
+        _active_cookie.auth_user = prev.get("auth_user")
+        return prev.get("str", ""), prev.get("sapisid")
 
 
 def make_sapisidhash(sapisid: str) -> str:
@@ -79,7 +150,7 @@ def make_sapisidhash(sapisid: str) -> str:
 
 def _account_prefix() -> str:
     """Return the Gemini account path prefix for non-default Google accounts."""
-    auth_user = CONFIG.get("auth_user")
+    auth_user = _active_auth_user()
     if auth_user is None or auth_user == "":
         return ""
     return f"/u/{auth_user}"
@@ -95,7 +166,7 @@ def _build_headers() -> dict:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
     if account_prefix:
-        headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+        headers["X-Goog-AuthUser"] = str(_active_auth_user())
     cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
@@ -117,7 +188,7 @@ def _apply_chat_persistence_flags(inner: list) -> None:
 def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     inner = [None] * 102
     if file_refs:
-        refs = [[None, None, ref] for ref in file_refs]
+        refs = [[[ref], "image.png"] for ref in file_refs]  # [[url], filename] per HanaokaYuzu format
         inner[0] = [prompt, 0, None, refs, None, None, 0]
     else:
         inner[0] = [prompt, 0, None, None, None, None, 0]
@@ -148,7 +219,7 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
 
 
 def _get_url() -> str:
-    reqid = int(time.time()) % 1000000
+    reqid = int(time.time() * 1000) % 1000000
     account_prefix = _account_prefix()
     return (
         f"https://gemini.google.com{account_prefix}/_/BardChatUi/data/"
@@ -202,33 +273,202 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
+def _extract_conversation_id(line: str):
+    """Parse a single wrb.fr line and return the conversation id (inner[1][0])."""
+    if '"wrb.fr"' not in line or len(line) < 200:
+        return None
+    try:
+        arr = json.loads(line)
+        inner_str = arr[0][2]
+        if not inner_str:
+            return None
+        inner = json.loads(inner_str)
+        if isinstance(inner, list) and len(inner) > 1 and isinstance(inner[1], list) and inner[1]:
+            cid = inner[1][0]
+            if isinstance(cid, str) and cid:
+                return cid
+    except (json.JSONDecodeError, IndexError, TypeError):
+        return None
+    return None
+
+
+def extract_conversation_id(raw: str) -> str:
+    """Extract conversation id from a full (non-streaming) response."""
+    for line in raw.split("\n"):
+        cid = _extract_conversation_id(line)
+        if cid:
+            return cid
+    return None
+
+
+def _delete_url() -> str:
+    reqid = int(time.time() * 1000) % 1000000
+    account_prefix = _account_prefix()
+    return (
+        f"https://gemini.google.com{account_prefix}/_/BardChatUi/data/"
+        "batchexecute"
+        f"?rpcids=hNktQb&bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
+    )
+
+
+def delete_conversation(cid: str) -> bool:
+    """EXPERIMENTAL: best-effort delete of a conversation from account history.
+
+    Upstream rejects the hNktQb batchexecute call on current builds (XSRF
+    error 138/139), so this only logs failures. Recommended alternative:
+    temporary_chats=true (conversations are never saved at all).
+    """
+    if not cid:
+        return False
+    inner_arg = '["' + cid + '",1]'
+    payload = json.dumps([[["hNktQb", inner_arg, None, "generic"]]], separators=(",", ":"))
+    body = urllib.parse.urlencode({"f.req": payload, "at": CONFIG.get("xsrf_token") or ""})
+    headers = _build_headers()
+    client = _get_httpx_client() if HAS_HTTPX else None
+    try:
+        if client is not None:
+            resp = client.post(_delete_url(), content=body, headers=headers, timeout=15)
+            text = resp.text
+            resp.raise_for_status()
+        else:
+            text = _urllib_post(_delete_url(), body.encode(), headers)
+        ok = "BardErrorInfo" not in text
+        log(f"History delete cid={cid[:14]}...: {'ok' if ok else 'rejected'}")
+        return ok
+    except Exception as e:
+        log(f"History delete failed cid={cid[:14]}...: {e}")
+        return False
+
+
+def schedule_history_delete(cid: str):
+    """Fire and forget history deletion (auto_delete_history config)."""
+    if not CONFIG.get("auto_delete_history") or not cid:
+        return
+    threading.Thread(target=delete_conversation, args=(cid,), daemon=True).start()
+
+
+def _get_semaphore():
+    global _upstream_semaphore
+    limit = CONFIG.get("max_concurrent_requests") or 0
+    if limit <= 0:
+        return None
+    with _upstream_sema_lock:
+        if _upstream_semaphore is None:
+            _upstream_semaphore = threading.BoundedSemaphore(limit)
+        return _upstream_semaphore
+
+
+class _UpstreamSlot:
+    """Context manager acquiring a global upstream concurrency slot (if capped).
+
+    Gemini Web only serves ~3-4 concurrent streams per account well; beyond
+    that it slow-walks or rejects requests. Capping locally queues requests
+    FIFO instead, which keeps tail latency predictable.
+    """
+
+    def __enter__(self):
+        sema = _get_semaphore()
+        self._sema = sema
+        if sema is None:
+            return self
+        self._t0 = time.time()
+        sema.acquire()
+        waited = time.time() - self._t0
+        if waited > 0.5:
+            log(f"Upstream busy: queued {waited:.1f}s (max_concurrent_requests={CONFIG.get('max_concurrent_requests')})")
+        return self
+
+    def __exit__(self, *exc):
+        if self._sema is not None:
+            self._sema.release()
+        return False
+
+
+def _retry_delay(attempt: int) -> float:
+    """Exponential backoff with jitter, capped at 15s."""
+    base = CONFIG.get("retry_delay_sec", 2)
+    return min(base * (2 ** attempt) + random.uniform(0, 0.5), 15)
+
+
+def _urllib_post(url: str, body: bytes, headers: dict) -> str:
+    """Fallback POST via urllib (no connection pooling), used when httpx is absent."""
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    proxy = CONFIG.get("proxy")
+    ctx = _get_ssl_ctx()
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            urllib.request.HTTPSHandler(context=ctx),
+        )
+        resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+    else:
+        resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
+    return resp.read().decode("utf-8", errors="replace")
+
+
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    """Non-streaming generation with retry."""
+    """Non-streaming generation with retry.
+
+    Concurrent identical requests (same prompt/model/cookie) are coalesced
+    into a single upstream call - common when several browser tabs translate
+    the same text at once.
+    """
+    key = (
+        prompt, model_id, think_mode, _active_cookie_path(),
+        tuple(file_refs or []),
+        tuple(sorted(extra_fields.items())) if extra_fields else None,
+    )
+    with _inflight_lock:
+        entry = _inflight.get(key)
+        is_owner = entry is None
+        if is_owner:
+            entry = {"event": threading.Event(), "result": None, "error": None}
+            _inflight[key] = entry
+    if not is_owner:
+        entry["event"].wait(timeout=CONFIG["request_timeout_sec"] * 2 + 10)
+        if entry["error"] is not None:
+            raise entry["error"]
+        return entry["result"]
+    try:
+        result = _generate_upstream(prompt, model_id, think_mode, file_refs, extra_fields)
+        entry["result"] = result
+        return result
+    except Exception as e:
+        entry["error"] = e
+        raise
+    finally:
+        with _inflight_lock:
+            _inflight.pop(key, None)
+        entry["event"].set()
+
+
+def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+    """Single-owner upstream call with retries. Uses the pooled httpx client."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
     headers = _build_headers()
-    ctx = _get_ssl_ctx()
-    proxy = CONFIG.get("proxy")
+    client = _get_httpx_client() if HAS_HTTPX else None
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
         try:
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            if proxy:
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                    urllib.request.HTTPSHandler(context=ctx)
-                )
-                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
-            else:
-                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            raw = resp.read().decode("utf-8", errors="replace")
-            return extract_response_text(raw)
+            with _UpstreamSlot():
+                if client is not None:
+                    resp = client.post(url, content=body, headers=headers)
+                    resp.raise_for_status()
+                    raw = resp.text
+                else:
+                    raw = _urllib_post(url, body, headers)
+            text = extract_response_text(raw)
+            if CONFIG.get("auto_delete_history"):
+                schedule_history_delete(extract_conversation_id(raw))
+            return text
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
-                time.sleep(CONFIG["retry_delay_sec"])
+                delay = _retry_delay(attempt)
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']} in {delay:.1f}s: {e}")
+                time.sleep(delay)
     raise last_err
 
 
@@ -247,34 +487,44 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
 
     last_err = None
     emitted_raw_text = ""
+    stream_cid = None
     for attempt in range(CONFIG["retry_attempts"]):
+        stream_cid = None
         try:
-            with client.stream("POST", url, content=body, headers=headers) as resp:
-                resp.raise_for_status()
-                buf = ""
-                for chunk in resp.iter_text():
-                    buf += chunk
-                    if "BardErrorInfo" in buf:
-                        bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
-                        if bard_err:
-                            raise RuntimeError(
-                                f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
-                            )
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        for t in _extract_texts_from_line(line):
-                            if t == emitted_raw_text or emitted_raw_text.startswith(t):
-                                continue
-                            if not t.startswith(emitted_raw_text):
-                                raise RuntimeError("Gemini stream content changed during retry")
-                            delta = clean_text(t[len(emitted_raw_text):], strip=False)
-                            emitted_raw_text = t
-                            if delta:
-                                yield delta
+            slot = _UpstreamSlot().__enter__()
+            try:
+                with client.stream("POST", url, content=body, headers=headers) as resp:
+                    resp.raise_for_status()
+                    buf = ""
+                    for chunk in resp.iter_text():
+                        buf += chunk
+                        if "BardErrorInfo" in buf:
+                            bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
+                            if bard_err:
+                                raise RuntimeError(
+                                    f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
+                                )
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            stream_cid = _extract_conversation_id(line) or stream_cid
+                            for t in _extract_texts_from_line(line):
+                                if t == emitted_raw_text or emitted_raw_text.startswith(t):
+                                    continue
+                                if not t.startswith(emitted_raw_text):
+                                    raise RuntimeError("Gemini stream content changed during retry")
+                                delta = clean_text(t[len(emitted_raw_text):], strip=False)
+                                emitted_raw_text = t
+                                if delta:
+                                    yield delta
+            finally:
+                slot.__exit__(None, None, None)
+            if CONFIG.get("auto_delete_history"):
+                schedule_history_delete(stream_cid)
             return
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
-                time.sleep(CONFIG["retry_delay_sec"])
+                delay = _retry_delay(attempt)
+                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']} in {delay:.1f}s: {e}")
+                time.sleep(delay)
     raise last_err

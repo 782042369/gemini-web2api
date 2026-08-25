@@ -7,7 +7,7 @@ from unittest import mock
 from urllib.parse import parse_qs
 
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
-from gemini_web2api.gemini import _build_payload
+from gemini_web2api.gemini import _build_payload, extract_conversation_id
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
 
@@ -65,7 +65,27 @@ class PayloadPersistenceTests(unittest.TestCase):
         inner = _decode_payload(_build_payload("describe", 1, 4, ["/uploaded/image-ref"]))
 
         self.assertEqual(inner[0][0], "describe")
-        self.assertEqual(inner[0][3], [[None, None, "/uploaded/image-ref"]])
+        self.assertEqual(inner[0][3], [[["/uploaded/image-ref"], "image.png"]])
+
+
+class ConversationIdTests(unittest.TestCase):
+    def _wrb_line(self, cid):
+        inner = [None, [cid, "r_id"], None, None, [[None, ["hello world " * 30]]]]
+        envelope = [["wrb.fr", None, None, None, None], [None, json.dumps(inner)]]
+        body = json.dumps(envelope)
+        return json.dumps([["wrb.fr", None, body, None, None]])[:0] + \
+            json.dumps([["wrb.fr", None, None]])[:0] + \
+            ('\n' + json.dumps([["wrb.fr", None, json.dumps([None, json.dumps(inner)])]]) + '\n')
+
+    def test_extracts_conversation_id(self):
+        inner = [None, ["c_test123", "rid"], None, None, [[None, ["padding " * 30]]]]
+        line = json.dumps([["wrb.fr", None, json.dumps(inner), None, None]])
+        cid = extract_conversation_id(line)
+        self.assertEqual(cid, "c_test123")
+
+    def test_returns_none_without_cid(self):
+        self.assertIsNone(extract_conversation_id("no wrb data here"))
+        self.assertIsNone(extract_conversation_id(""))
 
 
 class MessageParsingTests(unittest.TestCase):
