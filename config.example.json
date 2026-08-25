@@ -12,6 +12,9 @@
     "sk-gemini"
   ],
   "cookie_file": null,
+  "cookie_files": [],
+  "max_concurrent_requests": 0,
+  "auto_delete_history": false,
   "proxy": null,
   "log_requests": true,
   "temporary_chats": false

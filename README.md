@@ -175,7 +175,10 @@ Create `config.json` in the same directory:
   "cookie_file": null,
   "proxy": null,
   "log_requests": true,
-  "temporary_chats": false
+  "temporary_chats": false,
+  "cookie_files": [],
+  "max_concurrent_requests": 0,
+  "auto_delete_history": false
 }
 ```
 
@@ -183,6 +186,37 @@ Set `temporary_chats` to `true` to use Gemini Web temporary chats instead of
 persisting conversations to the account history.
 
 When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
+
+## Concurrency Performance
+
+Gemini Web only serves ~3-4 concurrent streams per account well; requests beyond
+that get slow-walked upstream (measured: 6 parallel short translations finished
+in 3.5s/10.5s/19.1s). Two settings control this:
+
+- `max_concurrent_requests` — cap concurrent upstream requests (0 = unlimited).
+  Excess requests are queued FIFO locally. Measured sweet spot is **4** per
+  Google account; raise it proportionally when adding cookie accounts.
+- `cookie_files` — pool of multiple Google account cookie files, rotated
+  round-robin per request. Each account gets its own upstream concurrency
+  budget, so N accounts ≈ N× throughput. The JSON cookie format supports a
+  per-account `"auth_user"` override:
+  ```json
+  {"cookie": "...", "sapisid": "...", "auth_user": "1"}
+  ```
+
+Additional built-in mitigations: identical concurrent requests are coalesced
+into a single upstream call, upstream connections are pooled and reused
+(httpx keep-alive), retries use exponential backoff with jitter, and the HTTP
+server speaks HTTP/1.1 keep-alive so clients reuse TCP connections.
+
+## Privacy: Auto History Cleanup
+
+Every API request creates a one-shot conversation in the Gemini Web account
+history. Set `auto_delete_history: true` to delete each conversation via
+the upstream DeleteConversation RPC right after the response completes
+(fire-and-forget, adds no latency). Works with both streaming and
+non-streaming endpoints, including coalesced requests. Alternative:
+`temporary_chats: true` never saves the conversation in the first place.
 
 ## Docker
 

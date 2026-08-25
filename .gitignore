@@ -3,7 +3,10 @@ __pycache__/
 config.json
 cookie.txt
 cookie.json
+cookie_*.txt
+cookie_*.json
 .env
 .idea
 .DS_Store
 gemini-auth.json
+docker-compose.override.yml

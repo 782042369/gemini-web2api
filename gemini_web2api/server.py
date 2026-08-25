@@ -8,7 +8,7 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .gemini import generate, generate_stream, log, pick_next_cookie
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
@@ -44,6 +44,13 @@ def _upload_images(images: list) -> list:
 
 
 class GeminiHandler(BaseHTTPRequestHandler):
+    # HTTP/1.1 keep-alive so clients (browser extensions, proxies) reuse TCP
+    # connections instead of paying a handshake per request. SSE responses
+    # opt out via "Connection: close" (no Content-Length can be known).
+    protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
+    timeout = 120  # close idle keep-alive connections
+
     def log_message(self, fmt, *args):
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
@@ -62,6 +69,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Access-Control-Allow-Origin", "*")
+        # Stream end is only signalled by connection close; never reuse.
+        self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
 
     def _parse_body(self, body: bytes) -> dict:
@@ -120,6 +130,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
+        # Let browsers cache the preflight instead of re-sending OPTIONS per request.
+        self.send_header("Access-Control-Max-Age", "7200")
         self.end_headers()
 
     def do_GET(self):
@@ -148,7 +160,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            # One Google account (cookie slot) per incoming request, round-robin.
+            pick_next_cookie()
             if self.path.startswith("/v1") and not self._authorized():
+                # Request body is unread; keep-alive would desync the connection.
+                self.close_connection = True
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             body = self._read_request_body()

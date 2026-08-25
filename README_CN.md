@@ -165,7 +165,10 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "cookie_file": null,
   "proxy": null,
   "log_requests": true,
-  "temporary_chats": false
+  "temporary_chats": false,
+  "cookie_files": [],
+  "max_concurrent_requests": 0,
+  "auto_delete_history": false
 }
 ```
 
@@ -173,6 +176,33 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 不会将对话保存在账号历史记录中。
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
+
+## 并发性能
+
+Gemini 网页端对单个账号大约只稳定支持 3-4 路并发流, 超出的请求会被上游
+降速排队 (实测 6 路并发短文本翻译完成时间为 3.5s/10.5s/19.1s). 相关配置:
+
+- `max_concurrent_requests` — 限制同时发往上游的请求数 (0 = 不限制), 超出
+  的请求在本地 FIFO 排队. 实测每个 Google 账号的较优值是 **4**; 增加
+  cookie 账号后可按比例调大.
+- `cookie_files` — 多个 Google 账号 cookie 文件列表, 每个请求轮询选用.
+  每个账号有独立的并发预算, N 个账号 ≈ N 倍吞吐. JSON cookie 格式支持
+  按账号覆盖 `"auth_user"`:
+  ```json
+  {"cookie": "...", "sapisid": "...", "auth_user": "1"}
+  ```
+
+内置的其它优化: 相同并发请求会合并为一次上游调用 (in-flight 合并),
+上游连接池化复用 (httpx keep-alive), 重试使用带抖动的指数退避, HTTP
+服务端启用 HTTP/1.1 keep-alive 让客户端复用 TCP 连接.
+
+## 隐私: 自动清理历史
+
+每个 API 请求都会在 Gemini Web 账号历史里创建一条一次性对话. 设置
+`auto_delete_history: true` 后, 每次响应完成后会立即通过上游
+DeleteConversation RPC 删除该对话 (fire-and-forget, 不增加响应延迟).
+流式与非流式端点均生效, 合并请求只删一次. 替代方案:
+`temporary_chats: true` 从一开始就不保存对话.
 
 ## Docker 部署
 

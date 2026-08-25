@@ -1,0 +1,25 @@
+services:
+  gemini-web2api:
+    build: .
+    container_name: gemini-web2api
+    # Bound to loopback by default; change to "8081:8081" to expose remotely
+    # (then make sure api_keys is set in config.json).
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - ./config.json:/app/config.json
+    # environment:
+    #   TZ: Asia/Shanghai
+    restart: unless-stopped
+    mem_limit: 512m
+    mem_reservation: 128m
+    memswap_limit: 512m
+    pids_limit: 512
+    logging:
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+# Machine-specific overrides (extra cookie mounts, external networks, ...)
+# belong in docker-compose.override.yml, which docker compose merges
+# automatically and which is gitignored.
