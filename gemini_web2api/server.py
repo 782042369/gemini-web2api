@@ -508,7 +508,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if req is None:
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
-        m = re.match(r'/v1beta/models/([^:?]+)', self.path)
+        # Accept both /v1beta/models/... (Gemini CLI) and /v1/models/...
+        # (Google SDK style); previously /v1 paths silently used default model.
+        m = re.match(r'/v1(?:beta)?/models/([^:?]+)', self.path)
         model_name = m.group(1) if m else CONFIG["default_model"]
         model_name, model_id, think_mode, err, extra_fields = resolve_model(model_name)
         if err:

@@ -17,5 +17,6 @@
   "auto_delete_history": false,
   "proxy": null,
   "log_requests": true,
-  "temporary_chats": false
+  "temporary_chats": false,
+  "keep_warm_interval_sec": 0
 }

@@ -20,6 +20,7 @@ DEFAULT_CONFIG = {
     "cookie_files": [],
     "max_concurrent_requests": 0,
     "auto_delete_history": False,
+    "keep_warm_interval_sec": 0,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

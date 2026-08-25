@@ -344,6 +344,10 @@ def schedule_history_delete(cid: str):
     """Fire and forget history deletion (auto_delete_history config)."""
     if not CONFIG.get("auto_delete_history") or not cid:
         return
+    if CONFIG.get("temporary_chats"):
+        # Temporary chats are never saved server-side; the delete RPC would
+        # just 400 (noise + a wasted upstream request on every generation).
+        return
     threading.Thread(target=delete_conversation, args=(cid,), daemon=True).start()
 
 
@@ -384,10 +388,24 @@ class _UpstreamSlot:
         return False
 
 
-def _retry_delay(attempt: int) -> float:
-    """Exponential backoff with jitter, capped at 15s."""
+def _retry_delay(attempt: int, transport_error: bool = False) -> float:
+    """Exponential backoff with jitter, capped at 15s.
+
+    Connection-level failures (stale pooled connection, TLS reset, DNS blip)
+    are retried immediately: the upstream hasn't rejected the request, so
+    sleeping 2s+ would only add latency to what is a fresh-reconnect case.
+    """
+    if transport_error:
+        return 0.05
     base = CONFIG.get("retry_delay_sec", 2)
     return min(base * (2 ** attempt) + random.uniform(0, 0.5), 15)
+
+
+def _is_transport_error(e: BaseException) -> bool:
+    """True for connection-level errors worth an immediate retry."""
+    if HAS_HTTPX and isinstance(e, httpx.TransportError):
+        return True
+    return isinstance(e, (ConnectionError, OSError)) and not isinstance(e, RuntimeError)
 
 
 def _urllib_post(url: str, body: bytes, headers: dict) -> str:
@@ -453,6 +471,7 @@ def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: l
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             with _UpstreamSlot():
+                t0 = time.time()
                 if client is not None:
                     resp = client.post(url, content=body, headers=headers)
                     resp.raise_for_status()
@@ -460,13 +479,14 @@ def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: l
                 else:
                     raw = _urllib_post(url, body, headers)
             text = extract_response_text(raw)
+            log(f"Upstream generate: {time.time() - t0:.2f}s chars={len(text)} attempt={attempt + 1}")
             if CONFIG.get("auto_delete_history"):
                 schedule_history_delete(extract_conversation_id(raw))
             return text
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
-                delay = _retry_delay(attempt)
+                delay = _retry_delay(attempt, transport_error=_is_transport_error(e))
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']} in {delay:.1f}s: {e}")
                 time.sleep(delay)
     raise last_err
@@ -524,7 +544,40 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
-                delay = _retry_delay(attempt)
+                delay = _retry_delay(attempt, transport_error=_is_transport_error(e))
                 log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']} in {delay:.1f}s: {e}")
                 time.sleep(delay)
     raise last_err
+
+
+def _keep_warm_loop(interval: float):
+    """Background loop keeping the Google session warm (opt-in).
+
+    Gemini Web occasionally slow-walks the first generation after the
+    account has been idle for a minute+ (observed 5-15s vs ~2s normal).
+    A tiny periodic generation keeps the session hot. Costs one trivial
+    upstream request per interval per cookie slot, so it is opt-in via
+    keep_warm_interval_sec in config.json.
+    """
+    from .models import resolve_model
+    while True:
+        time.sleep(interval)
+        try:
+            pick_next_cookie()  # rotate across the cookie pool, like real traffic
+            _, model_id, think_mode, _, _ = resolve_model(CONFIG.get("default_model"))
+            generate("hi", model_id, think_mode, None, None)
+        except Exception as e:
+            log(f"keep-warm: {e}")
+
+
+def start_keep_warm():
+    """Start the keep-warm thread if keep_warm_interval_sec > 0."""
+    interval = CONFIG.get("keep_warm_interval_sec") or 0
+    try:
+        interval = float(interval)
+    except (TypeError, ValueError):
+        interval = 0
+    if interval <= 0:
+        return
+    threading.Thread(target=_keep_warm_loop, args=(interval,), daemon=True, name="keep-warm").start()
+    log(f"keep-warm enabled: every {interval:.0f}s")

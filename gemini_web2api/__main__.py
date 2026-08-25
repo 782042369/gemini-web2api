@@ -4,7 +4,7 @@ import os
 
 from .config import CONFIG, load_config, find_config
 from .models import MODELS
-from .gemini import HAS_HTTPX
+from .gemini import HAS_HTTPX, start_keep_warm
 from .server import GeminiHandler, ThreadedServer
 from . import __version__
 
@@ -39,7 +39,9 @@ def main():
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
+    print(f"  Keep-warm: {CONFIG.get('keep_warm_interval_sec') or 'off'}")
     print()
+    start_keep_warm()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
