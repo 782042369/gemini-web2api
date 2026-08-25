@@ -1,12 +1,40 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Secrets / credentials - never commit
 config.json
-cookie.txt
-cookie.json
-cookie_*.txt
-cookie_*.json
+cookie*.txt
+cookie*.json
+gemini-auth*.json
 .env
-.idea
-.DS_Store
-gemini-auth.json
+.env.*
+*.pem
+*.key
+
+# Machine-specific deployment overrides
 docker-compose.override.yml
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Runtime artifacts
+*.log
+logs/
+*.bak
+nohup.out
