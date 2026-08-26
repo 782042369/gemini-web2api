@@ -19,5 +19,6 @@
   "log_requests": true,
   "temporary_chats": false,
   "keep_warm_interval_sec": 0,
-  "slow_retry_sec": 60
+  "slow_retry_sec": 60,
+  "impersonate": "chrome"
 }

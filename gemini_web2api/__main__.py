@@ -4,7 +4,7 @@ import os
 
 from .config import CONFIG, load_config, find_config
 from .models import MODELS
-from .gemini import HAS_HTTPX, start_keep_warm
+from .gemini import HAS_HTTPX, HAS_CURL_CFFI, start_keep_warm
 from .server import GeminiHandler, ThreadedServer
 from . import __version__
 
@@ -38,6 +38,7 @@ def main():
     print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
+    print(f"  Fingerprint: {'curl_cffi ' + (CONFIG.get('impersonate') or 'chrome') + ' (real browser TLS/h2)' if HAS_CURL_CFFI else 'python default (install curl_cffi to impersonate Chrome)'}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
     print(f"  Keep-warm: {CONFIG.get('keep_warm_interval_sec') or 'off'}")
     print()

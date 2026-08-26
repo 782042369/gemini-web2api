@@ -1,4 +1,4 @@
-"""Gemini StreamGenerate protocol implementation with httpx streaming."""
+"""Gemini StreamGenerate protocol implementation with streaming clients."""
 import json
 import time
 import uuid
@@ -17,10 +17,21 @@ try:
 except ImportError:
     HAS_HTTPX = False
 
+try:
+    from curl_cffi import requests as _curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+
 from .config import CONFIG
 
 _ssl_ctx = None
 _httpx_client = None
+
+# Full Chrome UA matching the curl_cffi impersonation profile. The previous
+# truncated "Mozilla/5.0 (... ) AppleWebKit/537.36" string is itself a bot tell.
+CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
 
 # Upstream concurrency cap (max_concurrent_requests config; 0 = unlimited).
 _upstream_semaphore = None
@@ -62,6 +73,29 @@ def _get_httpx_client():
             verify=True, limits=limits,
         )
     return _httpx_client
+
+
+# Thread-local browser-fingerprint sessions (curl_cffi). Python's default TLS
+# handshake + HTTP/1.1 is trivially distinguishable from a real browser and is
+# a likely trigger for Google's slow-walk treatment. curl_cffi impersonates a
+# genuine Chrome TLS/h2 fingerprint; sessions are per-thread because
+# curl_cffi Session is not guaranteed thread-safe.
+_browser_session_local = threading.local()
+
+
+def get_browser_session():
+    """Thread-local curl_cffi session impersonating Chrome, or None if absent."""
+    if not HAS_CURL_CFFI:
+        return None
+    s = getattr(_browser_session_local, "session", None)
+    if s is None:
+        proxy = CONFIG.get("proxy")
+        s = _curl_requests.Session(
+            impersonate=CONFIG.get("impersonate") or "chrome",
+            proxies={"http": proxy, "https": proxy} if proxy else None,
+        )
+        _browser_session_local.session = s
+    return s
 
 
 def _cookie_paths() -> list:
@@ -163,7 +197,7 @@ def _build_headers() -> dict:
         "Origin": "https://gemini.google.com",
         "Referer": f"https://gemini.google.com{account_prefix}/app",
         "X-Same-Domain": "1",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": CHROME_UA,
     }
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(_active_auth_user())
@@ -506,6 +540,7 @@ def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: l
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
     headers = _build_headers()
+    sess = get_browser_session()
     client = _get_httpx_client() if HAS_HTTPX else None
     attempt_timeout = _per_attempt_timeout()
 
@@ -515,7 +550,23 @@ def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: l
             with _UpstreamSlot():
                 t0 = time.time()
                 deadline_sec = _attempt_deadline()
-                if client is not None:
+                if sess is not None:
+                    # Preferred path: real Chrome TLS/h2 fingerprint.
+                    parts = []
+                    r = sess.post(url, data=body, headers=headers, stream=True,
+                                  timeout=(10, CONFIG["request_timeout_sec"]))
+                    try:
+                        r.raise_for_status()
+                        for chunk in r.iter_content():
+                            parts.append(chunk)
+                            if deadline_sec and time.time() - t0 > deadline_sec:
+                                raise _AttemptDeadlineExceeded(
+                                    f"slow-walk breaker: attempt exceeded {deadline_sec:.0f}s"
+                                )
+                    finally:
+                        r.close()
+                    raw = b"".join(parts).decode("utf-8", "replace")
+                elif client is not None:
                     # Stream the response even for non-streaming generate():
                     # iterating chunks lets us enforce a WALL-CLOCK deadline,
                     # which a plain read timeout cannot do when Google
@@ -552,8 +603,9 @@ def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: l
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
-    """Streaming generation via httpx with retry on connection failure."""
-    if not HAS_HTTPX:
+    """Streaming generation with retry on connection failure."""
+    sess = get_browser_session()
+    if sess is None and not HAS_HTTPX:
         text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         if text:
             yield text
@@ -562,7 +614,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
     headers = _build_headers()
-    client = _get_httpx_client()
+    client = _get_httpx_client() if HAS_HTTPX else None
 
     last_err = None
     emitted_raw_text = ""
@@ -574,34 +626,70 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             t0 = time.time()
             deadline_sec = _attempt_deadline()
             try:
-                with client.stream("POST", url, content=body, headers=headers,
-                                   timeout=_per_attempt_timeout()) as resp:
-                    resp.raise_for_status()
-                    buf = ""
-                    for chunk in resp.iter_text():
-                        buf += chunk
-                        if deadline_sec and time.time() - t0 > deadline_sec:
-                            raise _AttemptDeadlineExceeded(
-                                f"slow-walk breaker: stream exceeded {deadline_sec:.0f}s"
-                            )
-                        if "BardErrorInfo" in buf:
-                            bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
-                            if bard_err:
-                                raise RuntimeError(
-                                    f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
+                if sess is not None:
+                    # Preferred path: real Chrome TLS/h2 fingerprint.
+                    r = sess.post(url, data=body, headers=headers, stream=True,
+                                  timeout=(10, CONFIG["request_timeout_sec"]))
+                    try:
+                        r.raise_for_status()
+                        buf = b""
+                        for chunk in r.iter_content():
+                            buf += chunk
+                            if deadline_sec and time.time() - t0 > deadline_sec:
+                                raise _AttemptDeadlineExceeded(
+                                    f"slow-walk breaker: stream exceeded {deadline_sec:.0f}s"
                                 )
-                        while "\n" in buf:
-                            line, buf = buf.split("\n", 1)
-                            stream_cid = _extract_conversation_id(line) or stream_cid
-                            for t in _extract_texts_from_line(line):
-                                if t == emitted_raw_text or emitted_raw_text.startswith(t):
-                                    continue
-                                if not t.startswith(emitted_raw_text):
-                                    raise RuntimeError("Gemini stream content changed during retry")
-                                delta = clean_text(t[len(emitted_raw_text):], strip=False)
-                                emitted_raw_text = t
-                                if delta:
-                                    yield delta
+                            if b"BardErrorInfo" in buf:
+                                bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]',
+                                                     buf.decode("utf-8", "replace"))
+                                if bard_err:
+                                    raise RuntimeError(
+                                        f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
+                                    )
+                            while b"\n" in buf:
+                                line_b, buf = buf.split(b"\n", 1)
+                                line = line_b.decode("utf-8", "replace")
+                                stream_cid = _extract_conversation_id(line) or stream_cid
+                                for t in _extract_texts_from_line(line):
+                                    if t == emitted_raw_text or emitted_raw_text.startswith(t):
+                                        continue
+                                    if not t.startswith(emitted_raw_text):
+                                        raise RuntimeError("Gemini stream content changed during retry")
+                                    delta = clean_text(t[len(emitted_raw_text):], strip=False)
+                                    emitted_raw_text = t
+                                    if delta:
+                                        yield delta
+                    finally:
+                        r.close()
+                else:
+                    with client.stream("POST", url, content=body, headers=headers,
+                                       timeout=_per_attempt_timeout()) as resp:
+                        resp.raise_for_status()
+                        buf = ""
+                        for chunk in resp.iter_text():
+                            buf += chunk
+                            if deadline_sec and time.time() - t0 > deadline_sec:
+                                raise _AttemptDeadlineExceeded(
+                                    f"slow-walk breaker: stream exceeded {deadline_sec:.0f}s"
+                                )
+                            if "BardErrorInfo" in buf:
+                                bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
+                                if bard_err:
+                                    raise RuntimeError(
+                                        f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
+                                    )
+                            while "\n" in buf:
+                                line, buf = buf.split("\n", 1)
+                                stream_cid = _extract_conversation_id(line) or stream_cid
+                                for t in _extract_texts_from_line(line):
+                                    if t == emitted_raw_text or emitted_raw_text.startswith(t):
+                                        continue
+                                    if not t.startswith(emitted_raw_text):
+                                        raise RuntimeError("Gemini stream content changed during retry")
+                                    delta = clean_text(t[len(emitted_raw_text):], strip=False)
+                                    emitted_raw_text = t
+                                    if delta:
+                                        yield delta
             finally:
                 slot.__exit__(None, None, None)
             if CONFIG.get("auto_delete_history"):

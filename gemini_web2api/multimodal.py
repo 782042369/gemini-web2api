@@ -9,13 +9,13 @@ import re
 from urllib.parse import urlparse
 
 from .config import CONFIG
-from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log
+from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log, get_browser_session, CHROME_UA
 
 
 def _get_page_tokens() -> dict:
     """Fetch WIZ_global_data tokens from Gemini page (Push-ID, X-Client-Pctx)."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": CHROME_UA,
     }
     cookie_str, sapisid = load_cookie()
     if cookie_str:
@@ -23,17 +23,22 @@ def _get_page_tokens() -> dict:
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
     try:
-        req = urllib.request.Request("https://gemini.google.com/app", headers=headers)
-        proxy = CONFIG.get("proxy")
-        if proxy:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
-            )
-            resp = opener.open(req, timeout=30)
+        sess = get_browser_session()
+        if sess is not None:
+            resp = sess.get("https://gemini.google.com/app", headers=headers, timeout=30)
+            html = resp.text
         else:
-            resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
-        html = resp.read().decode()
+            req = urllib.request.Request("https://gemini.google.com/app", headers=headers)
+            proxy = CONFIG.get("proxy")
+            if proxy:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                    urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
+                )
+                resp = opener.open(req, timeout=30)
+            else:
+                resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
+            html = resp.read().decode()
         tokens = {}
         for key, pattern in [
             ("push_id", r'"qKIAYe":"([^"]+)"'),
@@ -94,6 +99,7 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
     cookie_str, sapisid = load_cookie()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
+    sess = get_browser_session()
 
     # Step 1: Initiate resumable upload
     start_headers = {
@@ -105,7 +111,7 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
         "X-Goog-Upload-Protocol": "resumable",
         "X-Goog-Upload-Command": "start",
         "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": CHROME_UA,
     }
     if cookie_str:
         start_headers["Cookie"] = cookie_str
@@ -113,18 +119,22 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
         start_headers["Authorization"] = make_sapisidhash(sapisid)
 
     start_url = "https://content-push.googleapis.com/upload/"
-    req = urllib.request.Request(start_url, data=b"", headers=start_headers, method="POST")
 
-    if proxy:
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-            urllib.request.HTTPSHandler(context=ctx)
-        )
-        resp = opener.open(req, timeout=30)
+    if sess is not None:
+        resp = sess.post(start_url, data=b"", headers=start_headers, timeout=30)
+        upload_url = resp.headers.get("X-Goog-Upload-URL")
     else:
-        resp = urllib.request.urlopen(req, context=ctx, timeout=30)
+        req = urllib.request.Request(start_url, data=b"", headers=start_headers, method="POST")
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=ctx)
+            )
+            resp = opener.open(req, timeout=30)
+        else:
+            resp = urllib.request.urlopen(req, context=ctx, timeout=30)
+        upload_url = resp.headers.get("X-Goog-Upload-URL") or resp.headers.get("x-goog-upload-url")
 
-    upload_url = resp.headers.get("X-Goog-Upload-URL") or resp.headers.get("x-goog-upload-url")
     if not upload_url:
         raise RuntimeError(f"No upload URL in response headers: {dict(resp.headers)}")
 
@@ -135,16 +145,19 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
         "X-Goog-Upload-Command": "upload, finalize",
         "X-Goog-Upload-Offset": "0",
         "Content-Type": "application/octet-stream",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": CHROME_UA,
     }
 
-    req2 = urllib.request.Request(upload_url, data=image_bytes, headers=upload_headers, method="POST")
-    if proxy:
-        resp2 = opener.open(req2, timeout=60)
+    if sess is not None:
+        resp2 = sess.post(upload_url, data=image_bytes, headers=upload_headers, timeout=60)
+        file_ref = resp2.text.strip()
     else:
-        resp2 = urllib.request.urlopen(req2, context=ctx, timeout=60)
-
-    file_ref = resp2.read().decode().strip()
+        req2 = urllib.request.Request(upload_url, data=image_bytes, headers=upload_headers, method="POST")
+        if proxy:
+            resp2 = opener.open(req2, timeout=60)
+        else:
+            resp2 = urllib.request.urlopen(req2, context=ctx, timeout=60)
+        file_ref = resp2.read().decode().strip()
     if not file_ref or not file_ref.startswith("/"):
         raise RuntimeError(f"Invalid file reference: {file_ref[:100]}")
 

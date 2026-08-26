@@ -22,6 +22,7 @@ DEFAULT_CONFIG = {
     "auto_delete_history": False,
     "keep_warm_interval_sec": 0,
     "slow_retry_sec": 60,
+    "impersonate": "chrome",
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
