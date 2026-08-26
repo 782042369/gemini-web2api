@@ -52,6 +52,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
     timeout = 120  # close idle keep-alive connections
 
     def log_message(self, fmt, *args):
+        # Health probes (GET / and favicon) poll every few minutes from
+        # monitors; logging each one just dilutes the business signal.
+        if self.command == "GET" and self.path in ("/", "/healthz", "/favicon.ico"):
+            return
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
 
