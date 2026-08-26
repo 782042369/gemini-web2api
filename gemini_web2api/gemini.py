@@ -403,6 +403,8 @@ def _retry_delay(attempt: int, transport_error: bool = False) -> float:
 
 def _is_transport_error(e: BaseException) -> bool:
     """True for connection-level errors worth an immediate retry."""
+    if isinstance(e, _AttemptDeadlineExceeded):
+        return True  # slow-walk breaker: retry at once, backoff would waste time
     if HAS_HTTPX and isinstance(e, httpx.TransportError):
         return True
     return isinstance(e, (ConnectionError, OSError)) and not isinstance(e, RuntimeError)
@@ -462,14 +464,12 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
 
 
 def _per_attempt_timeout():
-    """Read timeout for one upstream attempt (slow-walk circuit breaker).
+    """Per-read timeout for one upstream attempt (slow-walk detection aid).
 
-    Google occasionally slow-walks a request to 2-4 minutes (observed 140s,
-    218s) while the CDN edge cuts the client off at ~100s with a 524. Normal
-    generations finish in 2-3s (text) or 30-50s (vision); if nothing arrives
-    within slow_retry_sec the attempt is aborted and retried immediately —
-    a retry usually lands on a fast path and the whole request still
-    completes under the CDN deadline. 0 disables the breaker.
+    Note: httpx "read" timeout only fires BETWEEN chunks. Google slow-walks
+    often trickle bytes, keeping every inter-chunk gap short — so this alone
+    never bounds total time (observed 516s with read=60s). The real bound is
+    the wall-clock deadline enforced while iterating the streamed response.
     """
     deadline = CONFIG.get("slow_retry_sec") or 0
     total = CONFIG["request_timeout_sec"]
@@ -482,6 +482,23 @@ def _per_attempt_timeout():
     if HAS_HTTPX:
         return httpx.Timeout(total, read=deadline)
     return deadline
+
+
+def _attempt_deadline():
+    """Absolute wall-clock deadline for one upstream attempt, or None."""
+    deadline = CONFIG.get("slow_retry_sec") or 0
+    total = CONFIG["request_timeout_sec"]
+    try:
+        deadline = float(deadline)
+    except (TypeError, ValueError):
+        return None
+    if deadline <= 0 or deadline >= total:
+        return None
+    return deadline
+
+
+class _AttemptDeadlineExceeded(Exception):
+    """Wall-clock slow-walk breaker tripped for one upstream attempt."""
 
 
 def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
@@ -497,13 +514,29 @@ def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: l
         try:
             with _UpstreamSlot():
                 t0 = time.time()
+                deadline_sec = _attempt_deadline()
                 if client is not None:
-                    resp = client.post(url, content=body, headers=headers,
-                                       timeout=attempt_timeout)
-                    resp.raise_for_status()
-                    raw = resp.text
+                    # Stream the response even for non-streaming generate():
+                    # iterating chunks lets us enforce a WALL-CLOCK deadline,
+                    # which a plain read timeout cannot do when Google
+                    # slow-walks with a trickle of bytes.
+                    parts = []
+                    with client.stream("POST", url, content=body, headers=headers,
+                                       timeout=attempt_timeout) as resp:
+                        resp.raise_for_status()
+                        for chunk in resp.iter_text():
+                            parts.append(chunk)
+                            if deadline_sec and time.time() - t0 > deadline_sec:
+                                raise _AttemptDeadlineExceeded(
+                                    f"slow-walk breaker: attempt exceeded {deadline_sec:.0f}s"
+                                )
+                    raw = "".join(parts)
                 else:
                     raw = _urllib_post(url, body, headers, timeout=attempt_timeout)
+                    if deadline_sec and time.time() - t0 > deadline_sec:
+                        raise _AttemptDeadlineExceeded(
+                            f"slow-walk breaker: attempt exceeded {deadline_sec:.0f}s"
+                        )
             text = extract_response_text(raw)
             log(f"Upstream generate: {time.time() - t0:.2f}s chars={len(text)} attempt={attempt + 1}")
             if CONFIG.get("auto_delete_history"):
@@ -538,12 +571,19 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         stream_cid = None
         try:
             slot = _UpstreamSlot().__enter__()
+            t0 = time.time()
+            deadline_sec = _attempt_deadline()
             try:
-                with client.stream("POST", url, content=body, headers=headers) as resp:
+                with client.stream("POST", url, content=body, headers=headers,
+                                   timeout=_per_attempt_timeout()) as resp:
                     resp.raise_for_status()
                     buf = ""
                     for chunk in resp.iter_text():
                         buf += chunk
+                        if deadline_sec and time.time() - t0 > deadline_sec:
+                            raise _AttemptDeadlineExceeded(
+                                f"slow-walk breaker: stream exceeded {deadline_sec:.0f}s"
+                            )
                         if "BardErrorInfo" in buf:
                             bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
                             if bard_err:
