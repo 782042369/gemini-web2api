@@ -21,6 +21,7 @@ DEFAULT_CONFIG = {
     "max_concurrent_requests": 0,
     "auto_delete_history": False,
     "keep_warm_interval_sec": 0,
+    "slow_retry_sec": 60,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

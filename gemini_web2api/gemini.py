@@ -408,19 +408,20 @@ def _is_transport_error(e: BaseException) -> bool:
     return isinstance(e, (ConnectionError, OSError)) and not isinstance(e, RuntimeError)
 
 
-def _urllib_post(url: str, body: bytes, headers: dict) -> str:
+def _urllib_post(url: str, body: bytes, headers: dict, timeout=None) -> str:
     """Fallback POST via urllib (no connection pooling), used when httpx is absent."""
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     proxy = CONFIG.get("proxy")
     ctx = _get_ssl_ctx()
+    to = timeout if isinstance(timeout, (int, float)) else CONFIG["request_timeout_sec"]
     if proxy:
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
             urllib.request.HTTPSHandler(context=ctx),
         )
-        resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+        resp = opener.open(req, timeout=to)
     else:
-        resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
+        resp = urllib.request.urlopen(req, context=ctx, timeout=to)
     return resp.read().decode("utf-8", errors="replace")
 
 
@@ -460,12 +461,36 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
         entry["event"].set()
 
 
+def _per_attempt_timeout():
+    """Read timeout for one upstream attempt (slow-walk circuit breaker).
+
+    Google occasionally slow-walks a request to 2-4 minutes (observed 140s,
+    218s) while the CDN edge cuts the client off at ~100s with a 524. Normal
+    generations finish in 2-3s (text) or 30-50s (vision); if nothing arrives
+    within slow_retry_sec the attempt is aborted and retried immediately —
+    a retry usually lands on a fast path and the whole request still
+    completes under the CDN deadline. 0 disables the breaker.
+    """
+    deadline = CONFIG.get("slow_retry_sec") or 0
+    total = CONFIG["request_timeout_sec"]
+    try:
+        deadline = float(deadline)
+    except (TypeError, ValueError):
+        return None
+    if deadline <= 0 or deadline >= total:
+        return None
+    if HAS_HTTPX:
+        return httpx.Timeout(total, read=deadline)
+    return deadline
+
+
 def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Single-owner upstream call with retries. Uses the pooled httpx client."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
     headers = _build_headers()
     client = _get_httpx_client() if HAS_HTTPX else None
+    attempt_timeout = _per_attempt_timeout()
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
@@ -473,11 +498,12 @@ def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: l
             with _UpstreamSlot():
                 t0 = time.time()
                 if client is not None:
-                    resp = client.post(url, content=body, headers=headers)
+                    resp = client.post(url, content=body, headers=headers,
+                                       timeout=attempt_timeout)
                     resp.raise_for_status()
                     raw = resp.text
                 else:
-                    raw = _urllib_post(url, body, headers)
+                    raw = _urllib_post(url, body, headers, timeout=attempt_timeout)
             text = extract_response_text(raw)
             log(f"Upstream generate: {time.time() - t0:.2f}s chars={len(text)} attempt={attempt + 1}")
             if CONFIG.get("auto_delete_history"):
