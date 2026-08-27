@@ -138,24 +138,34 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Max-Age", "7200")
         self.end_headers()
 
+    def do_HEAD(self):
+        # HEAD-based monitors must see 2xx, not 501 Not Implemented.
+        path = self.path.split("?", 1)[0]
+        self.send_response(200 if path == "/" else 404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
+            # Strip query strings before routing: monitors often append
+            # cache-busters (/?t=123) which broke exact-match paths.
+            path = self.path.split("?", 1)[0]
+            if path.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            if self.path == "/v1/models":
+            if path == "/v1/models":
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path.startswith("/v1beta/models"):
+            elif path.startswith("/v1beta/models"):
                 self.send_json({"models": [
                     {"name": f"models/{n}", "displayName": n, "description": c["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path == "/":
+            elif path == "/":
                 self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
             else:
                 self.send_json({"error": "not found"}, 404)
