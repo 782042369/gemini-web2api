@@ -1,4 +1,4 @@
-"""Multimodal: Scotty resumable upload for Gemini image input."""
+"""Multimodal: one-shot multipart upload for Gemini image input."""
 import json
 import base64
 import urllib.request
@@ -6,6 +6,7 @@ import urllib.parse
 import time
 import ssl
 import re
+import uuid
 from urllib.parse import urlparse
 
 from .config import CONFIG
@@ -91,77 +92,88 @@ def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
 
 
 def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str = "image/png") -> str:
-    """Upload image via Scotty resumable upload. Returns file reference path."""
+    """Upload image via one-shot multipart POST to Google content-push.
+
+    Matches the current Gemini web client (same approach as
+    HanaokaYuzu/Gemini-API): a single multipart/form-data POST carries
+    Push-ID + X-Tenant-Id headers plus the file part, and the plain-text
+    response body is the /contrib_service/... file reference. The old
+    two-step Scotty resumable flow still uploads, but StreamGenerate now
+    rejects those references with BardErrorInfo 1100/1003.
+
+    Parameters:
+        image_bytes: raw image bytes to upload.
+        filename: filename reported to Google for the multipart file part.
+        mime_type: MIME type of the image (e.g. image/jpeg).
+
+    Returns:
+        File reference path (e.g. /contrib_service/ttl_1d/...).
+
+    Raises:
+        RuntimeError: on HTTP failure or when the response is not a valid
+            file reference.
+    """
     tokens = _cached_page_tokens()
     push_id = tokens.get("push_id", "feeds/mcudyrk2a4khkz")
-    pctx = tokens.get("pctx", "CgcSBWjK7pYx")
 
     cookie_str, sapisid = load_cookie()
-    ctx = _get_ssl_ctx()
-    proxy = CONFIG.get("proxy")
-    sess = get_browser_session()
-
-    # Step 1: Initiate resumable upload
-    start_headers = {
+    headers = {
         "Push-ID": push_id,
         "X-Tenant-Id": "bard-storage",
-        "X-Client-Pctx": pctx,
-        "X-Goog-Upload-Header-Content-Length": str(len(image_bytes)),
-        "X-Goog-Upload-Header-Content-Type": mime_type,
-        "X-Goog-Upload-Protocol": "resumable",
-        "X-Goog-Upload-Command": "start",
-        "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+        "Origin": "https://gemini.google.com",
+        "Referer": "https://gemini.google.com/",
         "User-Agent": CHROME_UA,
     }
     if cookie_str:
-        start_headers["Cookie"] = cookie_str
+        headers["Cookie"] = cookie_str
     if sapisid:
-        start_headers["Authorization"] = make_sapisidhash(sapisid)
+        headers["Authorization"] = make_sapisidhash(sapisid)
 
-    start_url = "https://content-push.googleapis.com/upload/"
-
+    url = "https://content-push.googleapis.com/upload"
+    sess = get_browser_session()
     if sess is not None:
-        resp = sess.post(start_url, data=b"", headers=start_headers, timeout=30)
-        upload_url = resp.headers.get("X-Goog-Upload-URL")
+        # Preferred path: real Chrome TLS fingerprint via curl_cffi.
+        # curl_cffi does not support the "files" kwarg; it wants a CurlMime part.
+        from curl_cffi import CurlMime
+        mime_part = CurlMime()
+        try:
+            mime_part.addpart(name="file", content_type=mime_type,
+                              filename=filename, data=image_bytes)
+            resp = sess.post(url, multipart=mime_part, headers=headers, timeout=60)
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"Image upload failed: HTTP {resp.status_code} {resp.text[:120]}")
+            file_ref = resp.text.strip()
+        finally:
+            mime_part.close()
     else:
-        req = urllib.request.Request(start_url, data=b"", headers=start_headers, method="POST")
+        # Fallback: hand-rolled multipart body over urllib.
+        boundary = "----geminiweb2api" + uuid.uuid4().hex
+        body = (
+            b"--" + boundary.encode() + b"\r\n"
+            + f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
+            + f"Content-Type: {mime_type}\r\n\r\n".encode()
+            + image_bytes + b'\r\n'
+            + b"--" + boundary.encode() + b"--\r\n"
+        )
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        ctx = _get_ssl_ctx()
+        proxy = CONFIG.get("proxy")
         if proxy:
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=ctx)
+                urllib.request.HTTPSHandler(context=ctx),
             )
-            resp = opener.open(req, timeout=30)
+            resp = opener.open(req, timeout=60)
         else:
-            resp = urllib.request.urlopen(req, context=ctx, timeout=30)
-        upload_url = resp.headers.get("X-Goog-Upload-URL") or resp.headers.get("x-goog-upload-url")
+            resp = urllib.request.urlopen(req, context=ctx, timeout=60)
+        file_ref = resp.read().decode().strip()
 
-    if not upload_url:
-        raise RuntimeError(f"No upload URL in response headers: {dict(resp.headers)}")
-
-    log(f"Upload session started: {upload_url[:80]}...")
-
-    # Step 2: Upload file data + finalize
-    upload_headers = {
-        "X-Goog-Upload-Command": "upload, finalize",
-        "X-Goog-Upload-Offset": "0",
-        "Content-Type": "application/octet-stream",
-        "User-Agent": CHROME_UA,
-    }
-
-    if sess is not None:
-        resp2 = sess.post(upload_url, data=image_bytes, headers=upload_headers, timeout=60)
-        file_ref = resp2.text.strip()
-    else:
-        req2 = urllib.request.Request(upload_url, data=image_bytes, headers=upload_headers, method="POST")
-        if proxy:
-            resp2 = opener.open(req2, timeout=60)
-        else:
-            resp2 = urllib.request.urlopen(req2, context=ctx, timeout=60)
-        file_ref = resp2.read().decode().strip()
     if not file_ref or not file_ref.startswith("/"):
         raise RuntimeError(f"Invalid file reference: {file_ref[:100]}")
 
-    log(f"Image uploaded: {filename} -> {file_ref[:50]}...")
+    log(f"Image uploaded (multipart): {filename} -> {file_ref[:50]}...")
     return file_ref
 
 

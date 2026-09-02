@@ -190,7 +190,18 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
-def _build_headers() -> dict:
+def _build_headers(uuid_val: str = None) -> dict:
+    """Build request headers for StreamGenerate.
+
+    Parameters:
+        uuid_val: request uuid shared with inner[59] of the payload. When
+            set, it is also sent as the x-goog-ext-525005358-jspb header
+            (["<uuid>",1]) like the current web client, which binds the
+            request to uploaded file references.
+
+    Returns:
+        Header dict for the StreamGenerate POST.
+    """
     account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -199,6 +210,8 @@ def _build_headers() -> dict:
         "X-Same-Domain": "1",
         "User-Agent": CHROME_UA,
     }
+    if uuid_val:
+        headers["x-goog-ext-525005358-jspb"] = f'["{uuid_val}",1]'
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(_active_auth_user())
     cookie_str, sapisid = load_cookie()
@@ -219,7 +232,20 @@ def _apply_chat_persistence_flags(inner: list) -> None:
         inner[41] = [2]
 
 
-def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, uuid_val: str = None) -> str:
+    """Build the urlencoded f.req payload for StreamGenerate.
+
+    Parameters:
+        prompt: user prompt text.
+        model_id: MODE_CATEGORY id (1=FAST, 2=THINKING, 3=PRO, 4=AUTO...).
+        think_mode: thinking level (0=dynamic, 4=default).
+        file_refs: list of uploaded file references to attach.
+        extra_fields: optional {index: value} overrides for inner payload slots.
+        uuid_val: request uuid for inner[59]; generated (uppercase) when omitted.
+
+    Returns:
+        urlencoded request body string.
+    """
     inner = [None] * 102
     if file_refs:
         refs = [[[ref], "image.png"] for ref in file_refs]  # [[url], filename] per HanaokaYuzu format
@@ -238,7 +264,7 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     inner[30] = [4]
     _apply_chat_persistence_flags(inner)
     inner[53] = 0
-    inner[59] = str(uuid.uuid4())
+    inner[59] = uuid_val or str(uuid.uuid4()).upper()
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
@@ -296,7 +322,7 @@ def _extract_texts_from_line(line: str) -> list:
 
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
-    bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
+    bard_err = re.search(r'BardErrorInfo(?:\s*"?\s*,)?\s*\[\s*(\d+)\s*\]', raw)
     if bard_err:
         raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
     last_text = ""
@@ -537,9 +563,10 @@ class _AttemptDeadlineExceeded(Exception):
 
 def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Single-owner upstream call with retries. Uses the pooled httpx client."""
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
+    uuid_val = str(uuid.uuid4()).upper()
+    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields, uuid_val).encode()
     url = _get_url()
-    headers = _build_headers()
+    headers = _build_headers(uuid_val)
     sess = get_browser_session()
     client = _get_httpx_client() if HAS_HTTPX else None
     attempt_timeout = _per_attempt_timeout()
@@ -611,9 +638,10 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             yield text
         return
 
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
+    uuid_val = str(uuid.uuid4()).upper()
+    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields, uuid_val)
     url = _get_url()
-    headers = _build_headers()
+    headers = _build_headers(uuid_val)
     client = _get_httpx_client() if HAS_HTTPX else None
 
     last_err = None
@@ -640,7 +668,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                     f"slow-walk breaker: stream exceeded {deadline_sec:.0f}s"
                                 )
                             if b"BardErrorInfo" in buf:
-                                bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]',
+                                bard_err = re.search(r'BardErrorInfo(?:\s*"?\s*,)?\s*\[\s*(\d+)\s*\]',
                                                      buf.decode("utf-8", "replace"))
                                 if bard_err:
                                     raise RuntimeError(
@@ -673,7 +701,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                     f"slow-walk breaker: stream exceeded {deadline_sec:.0f}s"
                                 )
                             if "BardErrorInfo" in buf:
-                                bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
+                                bard_err = re.search(r'BardErrorInfo(?:\s*"?\s*,)?\s*\[\s*(\d+)\s*\]', buf)
                                 if bard_err:
                                     raise RuntimeError(
                                         f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
