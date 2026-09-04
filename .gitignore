@@ -38,3 +38,6 @@ Thumbs.db
 logs/
 *.bak
 nohup.out
+
+# Timestamped backups (missed by plain *.bak)
+*.bak-*
