@@ -8,8 +8,14 @@ services:
       - "127.0.0.1:8081:8081"
     volumes:
       - ./config.json:/app/config.json
-    # environment:
-    #   TZ: Asia/Shanghai
+      # rw since 2026-09-04: the service persists upstream cookie renewals
+      # back to this file, keeping the export fresh across restarts.
+      - ./cookie_pro.txt:/app/cookie_pro.txt
+    environment:
+      TZ: Asia/Shanghai
+    networks:
+      - default
+      - new-api-network
     restart: unless-stopped
     mem_limit: 512m
     mem_reservation: 128m
@@ -20,6 +26,13 @@ services:
         max-size: "20m"
         max-file: "3"
 
-# Machine-specific overrides (extra cookie mounts, external networks, ...)
-# belong in docker-compose.override.yml, which docker compose merges
-# automatically and which is gitignored.
+# Machine-specific config (cookie mount, TZ, external new-api network) was
+# merged here from docker-compose.override.yml on 2026-09-02 so that
+# "docker-compose ls" reports a single CONFIG FILE - the BT panel docker UI
+# cannot handle multi-file projects (it passes "a.yml,b.yml" as one path).
+# The former override file is kept as docker-compose.override.yml.bak-20260902.
+
+networks:
+  new-api-network:
+    external: true
+    name: ai939593xyz_new-api-network

@@ -1,5 +1,4 @@
-"""Multimodal: one-shot multipart upload for Gemini image input."""
-import json
+"""Multimodal: browser-aligned two-step Scotty resumable upload."""
 import base64
 import urllib.request
 import urllib.parse
@@ -14,7 +13,15 @@ from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log, get_browse
 
 
 def _get_page_tokens() -> dict:
-    """Fetch WIZ_global_data tokens from Gemini page (Push-ID, X-Client-Pctx)."""
+    """Fetch WIZ_global_data tokens from the Gemini app page.
+
+    Returns:
+        dict with "push_id" (qKIAYe), "pctx" (Ylro7b) and "at" (thykhd)
+        when present; {} on failure. The push_id binds uploads to the
+        signed-in account's storage bucket - without it an upload would
+        land in the anonymous bucket whose references StreamGenerate
+        rejects with BardErrorInfo 1100.
+    """
     headers = {
         "User-Agent": CHROME_UA,
     }
@@ -44,7 +51,7 @@ def _get_page_tokens() -> dict:
         for key, pattern in [
             ("push_id", r'"qKIAYe":"([^"]+)"'),
             ("pctx", r'"Ylro7b":"([^"]+)"'),
-            ("at", r'"thykhd":"([^"]+)"'),
+            ("at", r'"SNlM0e":"([^"]+)"'),
         ]:
             m = re.search(pattern, html)
             if m:
@@ -59,6 +66,11 @@ _page_tokens_cache = {"tokens": {}, "ts": 0}
 
 
 def _cached_page_tokens() -> dict:
+    """Return page tokens refreshed at most every 600s.
+
+    Returns:
+        Cached token dict (see _get_page_tokens).
+    """
     now = time.time()
     if now - _page_tokens_cache["ts"] > 600:
         _page_tokens_cache["tokens"] = _get_page_tokens()
@@ -67,7 +79,15 @@ def _cached_page_tokens() -> dict:
 
 
 def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
-    """Infer a common raster image MIME type from its file signature."""
+    """Infer a common raster image MIME type from its file signature.
+
+    Parameters:
+        image_bytes: raw image bytes.
+        fallback: MIME returned when no signature matches.
+
+    Returns:
+        The sniffed MIME type string.
+    """
     if not isinstance(image_bytes, bytes):
         return fallback
     if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -91,94 +111,15 @@ def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
     return fallback
 
 
-def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str = "image/png") -> str:
-    """Upload image via one-shot multipart POST to Google content-push.
-
-    Matches the current Gemini web client (same approach as
-    HanaokaYuzu/Gemini-API): a single multipart/form-data POST carries
-    Push-ID + X-Tenant-Id headers plus the file part, and the plain-text
-    response body is the /contrib_service/... file reference. The old
-    two-step Scotty resumable flow still uploads, but StreamGenerate now
-    rejects those references with BardErrorInfo 1100/1003.
+def fetch_image_bytes(url: str) -> bytes:
+    """Fetch image bytes from an http(s) URL.
 
     Parameters:
-        image_bytes: raw image bytes to upload.
-        filename: filename reported to Google for the multipart file part.
-        mime_type: MIME type of the image (e.g. image/jpeg).
+        url: image URL to download.
 
     Returns:
-        File reference path (e.g. /contrib_service/ttl_1d/...).
-
-    Raises:
-        RuntimeError: on HTTP failure or when the response is not a valid
-            file reference.
+        Raw image bytes, or b"" on unsupported scheme / failure.
     """
-    tokens = _cached_page_tokens()
-    push_id = tokens.get("push_id", "feeds/mcudyrk2a4khkz")
-
-    cookie_str, sapisid = load_cookie()
-    headers = {
-        "Push-ID": push_id,
-        "X-Tenant-Id": "bard-storage",
-        "Origin": "https://gemini.google.com",
-        "Referer": "https://gemini.google.com/",
-        "User-Agent": CHROME_UA,
-    }
-    if cookie_str:
-        headers["Cookie"] = cookie_str
-    if sapisid:
-        headers["Authorization"] = make_sapisidhash(sapisid)
-
-    url = "https://content-push.googleapis.com/upload"
-    sess = get_browser_session()
-    if sess is not None:
-        # Preferred path: real Chrome TLS fingerprint via curl_cffi.
-        # curl_cffi does not support the "files" kwarg; it wants a CurlMime part.
-        from curl_cffi import CurlMime
-        mime_part = CurlMime()
-        try:
-            mime_part.addpart(name="file", content_type=mime_type,
-                              filename=filename, data=image_bytes)
-            resp = sess.post(url, multipart=mime_part, headers=headers, timeout=60)
-            if resp.status_code != 200:
-                raise RuntimeError(
-                    f"Image upload failed: HTTP {resp.status_code} {resp.text[:120]}")
-            file_ref = resp.text.strip()
-        finally:
-            mime_part.close()
-    else:
-        # Fallback: hand-rolled multipart body over urllib.
-        boundary = "----geminiweb2api" + uuid.uuid4().hex
-        body = (
-            b"--" + boundary.encode() + b"\r\n"
-            + f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
-            + f"Content-Type: {mime_type}\r\n\r\n".encode()
-            + image_bytes + b'\r\n'
-            + b"--" + boundary.encode() + b"--\r\n"
-        )
-        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
-        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-        ctx = _get_ssl_ctx()
-        proxy = CONFIG.get("proxy")
-        if proxy:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=ctx),
-            )
-            resp = opener.open(req, timeout=60)
-        else:
-            resp = urllib.request.urlopen(req, context=ctx, timeout=60)
-        file_ref = resp.read().decode().strip()
-
-    if not file_ref or not file_ref.startswith("/"):
-        raise RuntimeError(f"Invalid file reference: {file_ref[:100]}")
-
-    log(f"Image uploaded (multipart): {filename} -> {file_ref[:50]}...")
-    return file_ref
-
-
-def fetch_image_bytes(url: str) -> bytes:
-    """Fetch image from URL."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         log(f"Image fetch skipped for unsupported URL scheme: {parsed.scheme or 'none'}")
@@ -198,3 +139,134 @@ def fetch_image_bytes(url: str) -> bytes:
     except Exception as e:
         log(f"Image fetch failed: {e}")
         return b""
+
+
+def _sanitize_upload_name(name: str) -> str:
+    """Strip characters that would break the start-request body.
+
+    Parameters:
+        name: requested filename.
+
+    Returns:
+        A safe single-line filename ("upload.bin" when empty).
+    """
+    name = (name or "").strip().replace("\r", "").replace("\n", "")
+    return name or "upload.bin"
+
+
+def _upload_post(url: str, headers: dict, data: bytes):
+    """POST bytes through the shared browser session (same exit as generate).
+
+    Parameters:
+        url: absolute upload URL.
+        headers: request headers.
+        data: raw request body bytes.
+
+    Returns:
+        (status_code, response_headers_dict, response_body_text).
+
+    Raises:
+        RuntimeError: on transport failure.
+    """
+    sess = get_browser_session()
+    if sess is not None:
+        resp = sess.post(url, headers=headers, data=data, timeout=90)
+        return resp.status_code, {k.lower(): v for k, v in resp.headers.items()}, resp.text
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    proxy = CONFIG.get("proxy")
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
+        )
+        resp = opener.open(req, timeout=90)
+    else:
+        resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=90)
+    body = resp.read().decode("utf-8", "replace")
+    heads = {k.lower(): v for k, v in resp.headers.items()}
+    return resp.status, heads, body
+
+
+def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str = "image/png") -> str:
+    """Upload an image via the browser-aligned two-step Scotty resumable flow.
+
+    Step 1 ("start") posts the filename + length to push.clients6.google.com
+    with the account's page push_id and receives a one-time upload URL;
+    step 2 ("upload, finalize") posts the raw bytes and the plain-text
+    response body is the /contrib_service/... file reference. Upload and
+    generation share the same session/exit so Google sees one account.
+
+    The earlier one-shot multipart POST to content-push.googleapis.com also
+    uploads successfully, but the references it yields are now rejected by
+    StreamGenerate with BardErrorInfo 1100 - the two-step flow is what the
+    current web client actually uses.
+
+    Parameters:
+        image_bytes: raw image bytes to upload.
+        filename: filename reported to Google in the start step.
+        mime_type: informational MIME (the resumable flow sends no mime).
+
+    Returns:
+        File reference path (e.g. /contrib_service/ttl_1d/...).
+
+    Raises:
+        RuntimeError: when page tokens are unavailable, either HTTP step
+            fails, or the response is not a valid file reference.
+    """
+    tokens = _cached_page_tokens()
+    push_id = tokens.get("push_id")
+    if not push_id:
+        raise RuntimeError(
+            "upload aborted: page push_id unavailable - references uploaded "
+            "without it are rejected by StreamGenerate (BardErrorInfo 1100)")
+    pctx = tokens.get("pctx")
+
+    cookie_str, sapisid = load_cookie()
+    base = {
+        "Origin": "https://gemini.google.com",
+        "Referer": "https://gemini.google.com/",
+        "X-Tenant-Id": "bard-storage",
+        "Push-ID": push_id,
+        "Accept": "*/*",
+        "User-Agent": CHROME_UA,
+    }
+    if pctx:
+        base["X-Client-Pctx"] = pctx
+    if cookie_str:
+        base["Cookie"] = cookie_str
+    if sapisid:
+        base["Authorization"] = make_sapisidhash(sapisid)
+
+    # Step 1: start - exchange filename/length for a one-time upload URL.
+    start_headers = dict(base)
+    start_headers.update({
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Header-Content-Length": str(len(image_bytes)),
+    })
+    status, heads, body = _upload_post(
+        "https://push.clients6.google.com/upload/",
+        start_headers,
+        ("File name: " + _sanitize_upload_name(filename)).encode(),
+    )
+    if status != 200:
+        raise RuntimeError(f"upload start failed: HTTP {status} {body[:160]}")
+    put_url = heads.get("x-goog-upload-url")
+    if not put_url:
+        raise RuntimeError("upload start: no x-goog-upload-url in response")
+
+    # Step 2: upload + finalize - raw bytes in, file reference out.
+    up_headers = dict(base)
+    up_headers.update({
+        "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+        "X-Goog-Upload-Command": "upload, finalize",
+        "X-Goog-Upload-Offset": "0",
+    })
+    status, _, body = _upload_post(put_url, up_headers, image_bytes)
+    if status != 200:
+        raise RuntimeError(f"upload finalize failed: HTTP {status} {body[:160]}")
+    ref = body.strip()
+    if not ref.startswith("/"):
+        raise RuntimeError(f"upload returned a non-reference body: {ref[:160]}")
+    return ref

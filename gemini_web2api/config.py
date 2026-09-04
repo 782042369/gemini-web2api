@@ -23,6 +23,12 @@ DEFAULT_CONFIG = {
     "keep_warm_interval_sec": 0,
     "slow_retry_sec": 60,
     "impersonate": "chrome",
+    # Transparent micro-batching of short single-segment generateContent
+    # requests (companion plugins firing burst translations). 0 disables.
+    "microbatch_sec": 1.5,
+    "microbatch_single_sec": 0.45,
+    "microbatch_max": 6,
+    "microbatch_max_prompt": 3000,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

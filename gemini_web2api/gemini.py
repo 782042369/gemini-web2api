@@ -47,6 +47,10 @@ _round_robin_lock = threading.Lock()
 _inflight = {}
 _inflight_lock = threading.Lock()
 
+# Cookie renewal: merge upstream Set-Cookie and persist back to disk (throttled).
+_cookie_write_lock = threading.Lock()
+_last_cookie_persist = {"t": 0.0}
+
 
 def log(msg: str):
     if CONFIG["log_requests"]:
@@ -176,6 +180,130 @@ def load_cookie() -> tuple:
         return prev.get("str", ""), prev.get("sapisid")
 
 
+def _parse_set_cookies(resp) -> dict:
+    """Extract name->value pairs from a response's Set-Cookie headers.
+
+    Args:
+        resp: upstream response object (curl_cffi / httpx / urllib style).
+
+    Returns:
+        dict of cookie name -> value (pair text before the first ';').
+    """
+    pairs = {}
+    headers = getattr(resp, "headers", None)
+    if headers is None:
+        return pairs
+    raw_list = []
+    try:
+        raw_list = headers.get_list("set-cookie")          # httpx.Headers
+    except AttributeError:
+        try:
+            raw_list = headers.getlist("set-cookie")        # curl_cffi / requests
+        except AttributeError:
+            single = headers.get("set-cookie") or headers.get("Set-Cookie")
+            if single:
+                raw_list = [single]
+    for item in raw_list:
+        head = item.split(";", 1)[0].strip()
+        if "=" in head:
+            name, _, value = head.partition("=")
+            pairs[name.strip()] = value.strip()
+    return pairs
+
+
+def _persist_cookie_file(cookie_file: str, cookie_str: str, sapisid, auth_user,
+                         min_interval: float = 300.0) -> None:
+    """Write the renewed cookie back to its JSON file, in place and throttled.
+
+    The cookie file is a single-file bind mount, so rename(2)-based atomic
+    replace fails (EBUSY); instead an in-place truncate+write guarded by a
+    lock is used, with fsync. Any failure is logged and non-fatal.
+
+    Args:
+        cookie_file: path of the cookie JSON file (as seen in-container).
+        cookie_str: merged Cookie header string to persist.
+        sapisid: current SAPISID value (kept as-is when None).
+        auth_user: per-account auth_user override (kept as-is when None).
+        min_interval: minimum seconds between two disk writes (throttle).
+
+    Returns:
+        None.
+    """
+    with _cookie_write_lock:
+        now = time.time()
+        if now - _last_cookie_persist["t"] < min_interval:
+            return
+        try:
+            data = {}
+            if os.path.exists(cookie_file):
+                with open(cookie_file, "r") as f:
+                    content = f.read().strip()
+                if content.startswith("{"):
+                    data = json.loads(content)
+            data["cookie"] = cookie_str
+            if sapisid:
+                data["sapisid"] = sapisid
+            if auth_user is not None:
+                data["auth_user"] = auth_user
+            with open(cookie_file, "w") as f:
+                f.write(json.dumps(data, ensure_ascii=False))
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(cookie_file, 0o600)
+            _last_cookie_persist["t"] = now
+            cache = _cookie_caches.get(cookie_file)
+            if cache is not None:
+                try:
+                    cache["mtime"] = os.path.getmtime(cookie_file)
+                except OSError:
+                    pass
+            log(f"Cookie persisted to {cookie_file}")
+        except Exception as e:
+            log(f"Cookie persist error: {e}")
+
+
+def _merge_response_cookies(resp) -> None:
+    """Merge upstream Set-Cookie renewals into the active cookie cache.
+
+    Google rotates short-lived session tokens (SIDCC / PSIDTS / OSID ...)
+    via Set-Cookie during normal traffic. Merging them keeps the in-memory
+    cookie fresh and (throttled) persisted, so container restarts no longer
+    fall back to a stale export from the sync extension.
+
+    Args:
+        resp: upstream response object whose Set-Cookie headers to merge.
+
+    Returns:
+        None. Failures are swallowed (best-effort renewal).
+    """
+    try:
+        updates = _parse_set_cookies(resp)
+    except Exception:
+        return
+    if not updates:
+        return
+    cookie_file = _active_cookie_path()
+    if not cookie_file:
+        return
+    cache = _cookie_caches.get(cookie_file)
+    if not cache or not cache.get("str"):
+        return
+    existing = dict(p.split("=", 1) for p in cache["str"].split("; ") if "=" in p)
+    if all(existing.get(k) == v for k, v in updates.items()):
+        return
+    existing.update(updates)
+    new_str = "; ".join(f"{k}={v}" for k, v in existing.items())
+    sapisid = updates.get("SAPISID") or cache.get("sapisid")
+    _cookie_caches[cookie_file] = {
+        "str": new_str,
+        "sapisid": sapisid,
+        "auth_user": cache.get("auth_user"),
+        "mtime": cache.get("mtime", 0),
+    }
+    log(f"Cookie renewed upstream ({len(updates)}): {', '.join(sorted(updates)[:5])}")
+    _persist_cookie_file(cookie_file, new_str, sapisid, cache.get("auth_user"))
+
+
 def make_sapisidhash(sapisid: str) -> str:
     ts = int(time.time())
     h = hashlib.sha1(f"{ts} {sapisid} https://gemini.google.com".encode()).hexdigest()
@@ -248,7 +376,17 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     """
     inner = [None] * 102
     if file_refs:
-        refs = [[[ref], "image.png"] for ref in file_refs]  # [[url], filename] per HanaokaYuzu format
+        # Attachment tuples copied verbatim from browser captures (see
+        # zexadev/gemini-web2api-go): each entry is
+        #   [[ref, kind, null, mime], filename, null x6, [0]]
+        # kind: 1=image, 2=video, 3=text. Shorter shapes (e.g. [[ref], name])
+        # upload fine but the generate call is rejected with
+        # BardErrorInfo [1100].
+        refs = [
+            [[ref, 1, None, "image/png"], "image.png",
+             None, None, None, None, None, None, [0]]
+            for ref in file_refs
+        ]
         inner[0] = [prompt, 0, None, refs, None, None, 0]
     else:
         inner[0] = [prompt, 0, None, None, None, None, 0]
@@ -448,13 +586,28 @@ class _UpstreamSlot:
         return False
 
 
-def _retry_delay(attempt: int, transport_error: bool = False) -> float:
-    """Exponential backoff with jitter, capped at 15s.
+def _retry_delay(attempt: int, transport_error: bool = False,
+                 rate_limited: bool = False) -> float:
+    """Exponential backoff with jitter, capped at 15s (60s when rate-limited).
 
     Connection-level failures (stale pooled connection, TLS reset, DNS blip)
     are retried immediately: the upstream hasn't rejected the request, so
     sleeping 2s+ would only add latency to what is a fresh-reconnect case.
+
+    Upstream 429/503 means account- or IP-level throttling: hammering it
+    again within 0.1s only deepens the penalty, so those retry on a long
+    ladder (10s, 25s) to let the limit cool down.
+
+    Args:
+        attempt: zero-based retry index.
+        transport_error: True for connection-level errors (immediate retry).
+        rate_limited: True when the error carried HTTP 429/503.
+
+    Returns:
+        Seconds to sleep before the next attempt.
     """
+    if rate_limited:
+        return min(10 + 15 * attempt, 60)
     if transport_error:
         return 0.05
     base = CONFIG.get("retry_delay_sec", 2)
@@ -561,8 +714,41 @@ class _AttemptDeadlineExceeded(Exception):
     """Wall-clock slow-walk breaker tripped for one upstream attempt."""
 
 
+_xsrf_refreshed_at = 0.0
+
+
+def _maybe_refresh_xsrf():
+    """Refresh CONFIG xsrf_token from the live app page (throttled).
+
+    The at= parameter binds a StreamGenerate request to the account's
+    CURRENT session. A stale at (from an exported cookie snapshot)
+    still passes plain-text generation, but uploaded-file references fail
+    session binding with BardErrorInfo [1100] - the file "does not belong"
+    to the session named by the old token. The live page always carries
+    the current token (WIZ_global_data thykhd), so pulling from there
+    (at most every 300s) keeps at= aligned with the account session.
+
+    Returns:
+        None; updates CONFIG["xsrf_token"] in place and logs the change.
+    """
+    global _xsrf_refreshed_at
+    if time.time() - _xsrf_refreshed_at < 300:
+        return
+    _xsrf_refreshed_at = time.time()
+    try:
+        from .multimodal import _cached_page_tokens
+        at = _cached_page_tokens().get("at")
+        if at and at.startswith("AOvx") and at != CONFIG.get("xsrf_token"):
+            old = (CONFIG.get("xsrf_token") or "")[:10]
+            CONFIG["xsrf_token"] = at
+            log(f"xsrf_token refreshed from page: {old}... -> {at[:10]}...")
+    except Exception as e:
+        log(f"xsrf refresh failed: {e}")
+
+
 def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Single-owner upstream call with retries. Uses the pooled httpx client."""
+    _maybe_refresh_xsrf()
     uuid_val = str(uuid.uuid4()).upper()
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields, uuid_val).encode()
     url = _get_url()
@@ -584,6 +770,7 @@ def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: l
                                   timeout=(10, CONFIG["request_timeout_sec"]))
                     try:
                         r.raise_for_status()
+                        _merge_response_cookies(r)
                         for chunk in r.iter_content():
                             parts.append(chunk)
                             if deadline_sec and time.time() - t0 > deadline_sec:
@@ -602,6 +789,7 @@ def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: l
                     with client.stream("POST", url, content=body, headers=headers,
                                        timeout=attempt_timeout) as resp:
                         resp.raise_for_status()
+                        _merge_response_cookies(resp)
                         for chunk in resp.iter_text():
                             parts.append(chunk)
                             if deadline_sec and time.time() - t0 > deadline_sec:
@@ -623,7 +811,9 @@ def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: l
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
-                delay = _retry_delay(attempt, transport_error=_is_transport_error(e))
+                rate_limited = any(s in str(e) for s in ("503", "429"))
+                delay = _retry_delay(attempt, transport_error=_is_transport_error(e),
+                                     rate_limited=rate_limited)
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']} in {delay:.1f}s: {e}")
                 time.sleep(delay)
     raise last_err
@@ -660,6 +850,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                   timeout=(10, CONFIG["request_timeout_sec"]))
                     try:
                         r.raise_for_status()
+                        _merge_response_cookies(r)
                         buf = b""
                         for chunk in r.iter_content():
                             buf += chunk
@@ -693,6 +884,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     with client.stream("POST", url, content=body, headers=headers,
                                        timeout=_per_attempt_timeout()) as resp:
                         resp.raise_for_status()
+                        _merge_response_cookies(resp)
                         buf = ""
                         for chunk in resp.iter_text():
                             buf += chunk
@@ -726,7 +918,9 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
-                delay = _retry_delay(attempt, transport_error=_is_transport_error(e))
+                rate_limited = any(s in str(e) for s in ("503", "429"))
+                delay = _retry_delay(attempt, transport_error=_is_transport_error(e),
+                                     rate_limited=rate_limited)
                 log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']} in {delay:.1f}s: {e}")
                 time.sleep(delay)
     raise last_err
