@@ -201,12 +201,25 @@ def _rotate_psidts() -> bool:
     cookie_str, _sapisid = load_cookie()
     if not cookie_str:
         return False
+    # RotateCookies lives on accounts.google.com and needs that domain's
+    # cookies (SID/HSID/SSID/...). Prefer the dedicated accounts_cookie
+    # export when present; a gemini-domain-only cookie jar gets 401.
+    rotate_cookie = cookie_str
+    try:
+        with open(cookie_file, "r") as f:
+            content = f.read().strip()
+        if content.startswith("{"):
+            acct = json.loads(content).get("accounts_cookie") or ""
+            if acct.strip():
+                rotate_cookie = acct.strip()
+    except (OSError, ValueError):
+        pass
     headers = {
         "Content-Type": "application/json",
         "Origin": "https://accounts.google.com",
         "Referer": "https://accounts.google.com/",
         "User-Agent": CHROME_UA,
-        "Cookie": cookie_str,
+        "Cookie": rotate_cookie,
     }
     body = '[000,"-0000000000000000000"]'
     try:
@@ -227,11 +240,56 @@ def _rotate_psidts() -> bool:
             log(f"Keepalive rotate: HTTP {getattr(resp, 'status_code', '?')}, falling back to heartbeat")
             return _generate_heartbeat()
         _merge_response_cookies(resp)
+        _sync_accounts_cookie(resp)
         _maybe_refresh_xsrf()
         return True
     except Exception as e:
         log(f"Keepalive rotate failed: {e}")
         return _generate_heartbeat()
+
+
+def _sync_accounts_cookie(resp) -> None:
+    """Apply RotateCookies renewals to the stored accounts_cookie field.
+
+    The accounts-domain export carries its own short-lived tokens; without
+    this sync it would age out and RotateCookies would start returning 401
+    again even though the main gemini cookie stays healthy.
+
+    Args:
+        resp: the RotateCookies response whose Set-Cookie headers to apply.
+
+    Returns:
+        None. Failures are logged and non-fatal.
+    """
+    try:
+        updates = _parse_set_cookies(resp)
+    except Exception:
+        return
+    if not updates:
+        return
+    cookie_file = _active_cookie_path() or CONFIG.get("cookie_file")
+    if not cookie_file:
+        return
+    try:
+        with open(cookie_file, "r") as f:
+            content = f.read().strip()
+        if not content.startswith("{"):
+            return
+        data = json.loads(content)
+        acct = data.get("accounts_cookie") or ""
+        if not acct.strip():
+            return
+        pairs = dict(p.split("=", 1) for p in acct.split("; ") if "=" in p)
+        changed = {k: v for k, v in updates.items() if k in pairs and pairs[k] != v}
+        if not changed:
+            return
+        pairs.update(changed)
+        data["accounts_cookie"] = "; ".join(f"{k}={v}" for k, v in pairs.items())
+        with open(cookie_file, "w") as f:
+            f.write(json.dumps(data, ensure_ascii=False))
+        log(f"accounts_cookie renewed ({len(changed)}): {', '.join(sorted(changed)[:4])}")
+    except Exception as e:
+        log(f"accounts_cookie sync failed: {e}")
 
 
 def _generate_heartbeat() -> bool:
