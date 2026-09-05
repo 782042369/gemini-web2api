@@ -29,6 +29,12 @@ _file_handler_path = None
 # the lock; a plain Lock() would self-deadlock on first file-sink setup.
 _setup_lock = threading.RLock()
 
+# Per-request correlation id (thread-local): set by the HTTP handler at
+# request start, appended by log() to every line emitted on that worker
+# thread. Threads without one (keepalive, microbatch dispatcher, main)
+# log in the original shape - existing grep keys are untouched.
+_request_ctx = threading.local()
+
 
 def _get_logger() -> logging.Logger:
     """Return the package logger with the stderr handler attached (lazy).
@@ -102,8 +108,35 @@ def _ensure_file_handler() -> None:
             _file_handler_path = None
 
 
+def set_request_id(request_id) -> None:
+    """Bind a correlation id to the current thread (None clears it).
+
+    Args:
+        request_id: short opaque id (e.g. 12 hex chars) or None.
+
+    Returns:
+        None.
+    """
+    _request_ctx.req_id = request_id
+
+
+def get_request_id():
+    """Return the correlation id bound to the current thread, if any.
+
+    Args:
+        None.
+
+    Returns:
+        The bound id string, or None when the thread has none.
+    """
+    return getattr(_request_ctx, "req_id", None)
+
+
 def log(msg: str):
     """Write one log line to stderr and the rotating file (when enabled).
+
+    When a request id is bound to this thread (see set_request_id), it is
+    appended as " req=<id>" so access and business lines correlate.
 
     Args:
         msg: message text (no trailing newline).
@@ -113,5 +146,8 @@ def log(msg: str):
     """
     if not CONFIG.get("log_requests"):
         return
+    rid = get_request_id()
+    if rid:
+        msg = f"{msg} req={rid}"
     _ensure_file_handler()
     _get_logger().info(msg)

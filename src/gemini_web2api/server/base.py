@@ -6,12 +6,14 @@ implementations live in the mixin modules and are combined into
 GeminiHandler at the bottom of this file.
 """
 import json
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
 from .. import __version__
 from ..config import CONFIG
-from ..logs import log
+from ..logs import get_request_id, log, set_request_id
 from ..models import MODELS
 from ..upstream import pick_next_cookie
 from .google import GoogleGenerateMixin
@@ -28,6 +30,11 @@ class BaseAPIHandler(BaseHTTPRequestHandler):
     timeout = 120  # close idle keep-alive connections
 
     def log_message(self, fmt, *args):
+        # POST access lines are emitted at request end by do_POST (with
+        # duration, status and request id); suppress the start-of-request
+        # default line to avoid duplicates.
+        if self.command == "POST":
+            return
         # Health probes (GET / and favicon) poll every few minutes from
         # monitors; logging each one just dilutes the business signal.
         if self.command == "GET" and self.path in ("/", "/healthz", "/favicon.ico"):
@@ -35,20 +42,59 @@ class BaseAPIHandler(BaseHTTPRequestHandler):
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
 
+    def _begin_request(self):
+        """Bind a correlation id to this worker thread and note the start.
+
+        Honors an inbound x-request-id header (proxies/gateways may set
+        one); otherwise generates a 12-hex id. The id is echoed on every
+        response and appended to all log lines from this thread.
+
+        Args:
+            None.
+
+        Returns:
+            The request start timestamp (time.time()).
+        """
+        rid = (self.headers.get("x-request-id") or "").strip() or uuid.uuid4().hex[:12]
+        set_request_id(rid)
+        self._resp_status = None
+        return time.time()
+
+    def _access_line(self, t_start) -> None:
+        """Emit the end-of-request access line with duration and status.
+
+        Args:
+            t_start: request start timestamp from _begin_request().
+
+        Returns:
+            None. Status falls back to 500 when no response was sent.
+        """
+        client_ip = self.client_address[0] if self.client_address else "-"
+        status = getattr(self, "_resp_status", None) or 500
+        path = self.path.split("?", 1)[0]
+        log(f'{client_ip} "{self.command} {path} HTTP/1.1" {status} '
+            f"{time.time() - t_start:.2f}s")
+
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode()
+        self._resp_status = status
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
+        if get_request_id():
+            self.send_header("x-request-id", get_request_id())
         self.end_headers()
         self.wfile.write(body)
 
     def _start_sse(self):
+        self._resp_status = 200
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Access-Control-Allow-Origin", "*")
+        if get_request_id():
+            self.send_header("x-request-id", get_request_id())
         # Stream end is only signalled by connection close; never reuse.
         self.send_header("Connection", "close")
         self.close_connection = True
@@ -149,6 +195,7 @@ class BaseAPIHandler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
+        t_start = self._begin_request()
         try:
             # One Google account (cookie slot) per incoming request, round-robin.
             pick_next_cookie()
@@ -176,6 +223,9 @@ class BaseAPIHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": {"message": str(e)}}, 500)
             except:
                 pass
+        finally:
+            self._access_line(t_start)
+            set_request_id(None)
 
 
 class GeminiHandler(OpenAIChatMixin, OpenAIResponsesMixin, GoogleGenerateMixin,
