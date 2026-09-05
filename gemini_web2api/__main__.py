@@ -5,6 +5,7 @@ import os
 from .config import CONFIG, load_config, find_config
 from .models import MODELS
 from .gemini import HAS_HTTPX, HAS_CURL_CFFI, start_keep_warm
+from .keepalive import start_keepalive
 from .server import GeminiHandler, ThreadedServer
 from . import __version__
 
@@ -43,6 +44,7 @@ def main():
     print(f"  Keep-warm: {CONFIG.get('keep_warm_interval_sec') or 'off'}")
     print()
     start_keep_warm()
+    start_keepalive()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

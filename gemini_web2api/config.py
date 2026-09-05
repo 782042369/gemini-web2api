@@ -25,6 +25,10 @@ DEFAULT_CONFIG = {
     "impersonate": "chrome",
     # Transparent micro-batching of short single-segment generateContent
     # requests (companion plugins firing burst translations). 0 disables.
+    # Active session keepalive: rotate PSIDTS + refresh SNlM0e every N
+    # seconds even with zero traffic (mirrors HanaokaYuzu auto_refresh,
+    # default 540s). 0 disables.
+    "keepalive_sec": 540,
     "microbatch_sec": 1.5,
     "microbatch_single_sec": 0.45,
     "microbatch_max": 6,
