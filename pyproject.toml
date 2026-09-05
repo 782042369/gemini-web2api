@@ -1,14 +1,20 @@
 [project]
 name = "gemini-web2api"
-version = "1.1.0"
+version = "1.2.0"
 description = "Convert Google Gemini web into OpenAI-compatible API"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.8"
-dependencies = []
+dependencies = [
+    "httpx>=0.25",
+    "curl_cffi>=0.16",
+]
 
 [project.optional-dependencies]
-streaming = ["httpx>=0.25"]
+dev = [
+    "pytest>=7",
+    "ruff>=0.4",
+]
 
 [project.scripts]
 gemini-web2api = "gemini_web2api.__main__:main"
@@ -16,3 +22,22 @@ gemini-web2api = "gemini_web2api.__main__:main"
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py38"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Conservative rule set: correctness and style only, no opinionated
+# formatting churn on battle-tested code.
+select = ["E", "W", "F"]
+ignore = [
+    "E501",  # long lines kept where they aid readability (log strings)
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

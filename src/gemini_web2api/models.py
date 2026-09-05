@@ -62,7 +62,7 @@ def resolve_model(model_name: str, default: str = "gemini-3.8-flash"):
             return None, None, None, f"Invalid think level: {think_str}", None
     cfg = MODELS.get(model_name)
     if not cfg:
-        from .gemini import log
+        from .logs import log
         log(f"Unknown model '{model_name}', falling back to '{default}'")
         model_name = default
         cfg = MODELS[default]

@@ -13,10 +13,10 @@ import time
 import urllib.request
 
 from .config import CONFIG
-from .gemini import (
-    log, load_cookie, generate, CHROME_UA, get_browser_session,
-    _get_ssl_ctx, _cookie_caches, _active_cookie_path,
-)
+from .logs import log
+from .upstream import generate
+from .upstream.cookies import _active_cookie_path, _cookie_caches, load_cookie
+from .upstream.transport import CHROME_UA, _get_ssl_ctx, get_browser_session
 
 
 _cookie_write_lock = threading.Lock()

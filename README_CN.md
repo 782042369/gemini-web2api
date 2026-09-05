@@ -6,7 +6,7 @@
 
 [English](README.md)
 
-将 Google Gemini 网页端转换为 OpenAI 兼容 API. 零成本, 跨平台, 单文件.
+将 Google Gemini 网页端转换为 OpenAI 兼容 API. 零成本, 跨平台, 模块化 Python 包.
 
 ## 特性
 
@@ -16,16 +16,25 @@
 - **多模型**: Flash (3.6), 扩展思考 (2万字+输出), Pro, Auto, Lite
 - **思考深度**: 通过 `@think=N` 后缀调节 (0=最深, 4=最浅)
 - **联网搜索**: 内置互联网访问 (Gemini 原生搜索能力)
-- **跨平台**: 纯 Python, 仅一个可选依赖 (`httpx` 用于流式输出)
-- **流式输出**: 基于 `httpx` 的 SSE Streaming 支持
+- **跨平台**: 纯 Python, 传输层优雅降级 (`curl_cffi` Chrome 指纹 → `httpx` → 标准库 `urllib`)
+- **流式输出**: 基于 `httpx` / `curl_cffi` 的 SSE Streaming 支持
 - **Codex CLI**: Responses API (`/v1/responses`) 兼容 OpenAI Codex
 - **Gemini CLI**: Google 原生 API (`/v1beta/models`) 兼容 Gemini CLI
 
 ## 快速开始
 
+源码运行:
+
 ```bash
-pip install httpx
-python gemini_web2api.py
+pip install -r requirements.txt
+PYTHONPATH=src python -m gemini_web2api
+```
+
+或安装为包:
+
+```bash
+pip install .
+gemini-web2api
 ```
 
 服务启动在 `http://localhost:8081/v1`.
@@ -103,7 +112,7 @@ gemini-3.5-flash-thinking@think=4   # 最浅
 匿名访问对所有模型有效, 但 `gemini-3.1-pro` 在无认证时会路由到 Flash. 要获得真正的 Pro 路由, 需要 **Gemini Advanced (付费订阅)** 账号的 cookie:
 
 ```bash
-python gemini_web2api.py --cookie-file cookie.txt
+python -m gemini_web2api --cookie-file cookie.txt
 ```
 
 ### 如何获取 Cookie
@@ -237,7 +246,7 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 
 **方式 1: 命令行参数**
 ```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
+python -m gemini_web2api --proxy http://127.0.0.1:7890
 ```
 
 **方式 2: config.json**
@@ -248,7 +257,7 @@ python gemini_web2api.py --proxy http://127.0.0.1:7890
 **方式 3: 环境变量** (自动检测)
 ```bash
 set HTTPS_PROXY=http://127.0.0.1:7890
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 支持 Clash, V2Ray, Shadowsocks 等任何 HTTP 代理.
@@ -281,8 +290,46 @@ resp = client.chat.completions.create(
 ## 系统要求
 
 - Python 3.8+
-- `httpx` (`pip install httpx`) — 用于流式请求
+- `httpx` 与 `curl_cffi` (`pip install -r requirements.txt`); 两者都缺失时自动降级到标准库 `urllib`
 - 需要能访问 `gemini.google.com` (部分地区需代理)
+
+## 项目结构
+
+```
+src/gemini_web2api/
+├── __main__.py            # CLI 入口 (python -m gemini_web2api)
+├── config.py              # 默认值 / JSON 加载 / 校验
+├── logs.py                # 统一日志门面 (stderr)
+├── models.py              # 模型目录 (MODE_CATEGORY 映射)
+├── upstream/              # Gemini Web 协议客户端
+│   ├── transport.py       #   curl_cffi / httpx / urllib 传输梯队
+│   ├── cookies.py         #   多账号 cookie 池, 逐请求轮转
+│   ├── protocol.py        #   请求头 / f.req 载荷 / 端点
+│   ├── parser.py          #   wrb.fr 响应解析
+│   ├── concurrency.py     #   FIFO 并发上限
+│   ├── history.py         #   会话删除
+│   └── generate.py        #   重试 / 同请求合并 / 流式管线
+├── keepalive.py           # 会话自续期 (RotateCookies, SNlM0e)
+├── multimodal.py          # 两步 Scotty 图片上传
+├── tools.py               # OpenAI 工具调用解析
+├── batching.py            # 微攒批 / 批量翻译
+└── server/                # HTTP API 层
+    ├── base.py            #   路由 / 鉴权 / SSE / 线程服务器
+    ├── images.py          #   共享图片上传助手
+    ├── openai_chat.py     #   /v1/chat/completions
+    ├── openai_responses.py#   /v1/responses (Codex CLI)
+    └── google.py          #   /v1beta generateContent (Gemini CLI)
+```
+
+## 开发
+
+```bash
+make test     # 单元测试 (无网络, 上游全 mock)
+make lint     # ruff 静态检查
+make run      # 源码启动开发服务器
+```
+
+CI 每次推送先跑 lint + 测试, 通过后才发布 Docker 镜像.
 
 ## 工作原理
 
