@@ -264,5 +264,73 @@ class HeaderBuildingTests(unittest.TestCase):
         self.assertEqual(headers.get("Origin"), "https://gemini.google.com")
 
 
+class _FakeStreamResponse:
+    """Minimal curl_cffi-style streaming response for pipeline tests."""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+        self.headers = {}
+        self.status_code = 200
+
+    def raise_for_status(self):
+        return None
+
+    def iter_content(self):
+        yield from self._chunks
+
+    def close(self):
+        return None
+
+
+class _FakeSession:
+    """Minimal curl_cffi-style session yielding canned response chunks."""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def post(self, url, data=None, headers=None, stream=False, timeout=None):
+        return _FakeStreamResponse(self._chunks)
+
+
+class StreamLatencyLogTests(unittest.TestCase):
+    """Lock the 'Upstream stream:' log format - production greps depend on it."""
+
+    def setUp(self):
+        self.saved = dict(CONFIG)
+        CONFIG.update({
+            "retry_attempts": 1, "log_requests": True,
+            "max_concurrent_requests": 0, "cookie_file": None,
+            "xsrf_token": None, "slow_retry_sec": 60,
+            "request_timeout_sec": 180, "auto_delete_history": False,
+            "temporary_chats": False,
+        })
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.saved)
+
+    @mock.patch("gemini_web2api.upstream.generate.log")
+    @mock.patch("gemini_web2api.upstream.generate.get_browser_session")
+    def test_stream_emits_deltas_and_latency_breakdown(self, get_sess, log_mock):
+        first = "hello streaming world " * 12
+        second = first + " plus a longer tail"
+        chunks = [(_wrb_line([first]) + "\n").encode("utf-8"),
+                  (_wrb_line([second]) + "\n").encode("utf-8")]
+        get_sess.return_value = _FakeSession(chunks)
+
+        from gemini_web2api.upstream.generate import generate_stream
+        deltas = list(generate_stream("test prompt", 1, 4))
+
+        self.assertEqual(deltas, [first, " plus a longer tail"])
+        summary = [str(c) for c in log_mock.call_args_list
+                   if "Upstream stream:" in str(c)]
+        self.assertEqual(len(summary), 1)
+        line = summary[0]
+        self.assertIn("ttfb=0.", line)        # measured, not n/a
+        self.assertIn("total=0.", line)
+        self.assertIn(f"chars={len(second)}", line)
+        self.assertIn("attempt=1", line)
+
+
 if __name__ == "__main__":
     unittest.main()

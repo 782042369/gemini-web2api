@@ -302,6 +302,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             deadline_sec = _attempt_deadline()
             try:
                 buf = ""
+                first_delta_t = None
                 for chunk in _stream_upstream_chunks(sess, client, url, body, headers):
                     buf += chunk
                     if deadline_sec and time.time() - t0 > deadline_sec:
@@ -325,11 +326,19 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             delta = clean_text(t[len(emitted_raw_text):], strip=False)
                             emitted_raw_text = t
                             if delta:
+                                if first_delta_t is None:
+                                    first_delta_t = time.time()
                                 yield delta
             finally:
                 slot.__exit__(None, None, None)
             if CONFIG.get("auto_delete_history"):
                 schedule_history_delete(stream_cid)
+            # Latency breakdown: ttfb (request sent -> first emitted delta)
+            # vs total (request sent -> stream end) separates "Google is
+            # slow to start" from "generation itself is long" in production
+            # logs. Format is a stable grep key; keep it byte-stable.
+            ttfb = f"{first_delta_t - t0:.2f}s" if first_delta_t is not None else "n/a"
+            log(f"Upstream stream: ttfb={ttfb} total={time.time() - t0:.2f}s chars={len(emitted_raw_text)} attempt={attempt + 1}")
             return
         except Exception as e:
             last_err = e
