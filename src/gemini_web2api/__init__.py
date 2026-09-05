@@ -8,4 +8,4 @@ Package layout:
     tools / batching           - OpenAI tool-call parsing, request batching
     server/                    - HTTP API layer (OpenAI + Google protocols)
 """
-__version__ = "1.2.0"
+__version__ = "1.2.1"

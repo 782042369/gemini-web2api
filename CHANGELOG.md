@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 semver.
 
+## [1.2.1] - 2026-09-05
+
+### Changed - streaming pipeline deduplication (behavior-preserving)
+
+- New `_stream_upstream_chunks()` transport adapter: the curl_cffi and
+  httpx code paths both surface as one decoded str chunk stream (curl
+  bytes go through an incremental UTF-8 decoder so multi-byte characters
+  split across chunks survive). `generate_stream` and
+  `_generate_upstream` now share a single chunk-to-line-to-delta
+  pipeline; the previous byte-for-byte duplicated branches (BardErrorInfo
+  detection, line parsing, delta extraction, slow-walk breaker x2) are
+  gone. Slow-walk breaker exception texts are unchanged (log greps rely
+  on them).
+
+### Added
+
+- 27 unit tests for upstream pure logic (tests/test_upstream.py):
+  wrb.fr response parsing and clean_text rules, retry backoff ladder
+  (rate-limited / transport / exponential-with-jitter), microbatch
+  eligibility and numbered-batch parsing incl. dropped-segment fallback,
+  batcher dispatch/error propagation, model resolution (@think= suffix),
+  SAPISIDHASH header building. Suite total: 47 tests.
+
 ## [1.2.0] - 2026-09-05
 
 ### Changed - engineering restructure (behavior-preserving)
