@@ -38,6 +38,11 @@ DEFAULT_CONFIG = {
     "microbatch_single_sec": 0.45,
     "microbatch_max": 6,
     "microbatch_max_prompt": 3000,
+    # Local log file (rotated daily at midnight, keeping
+    # log_retention_days days). None disables the file sink; stderr is
+    # always written.
+    "log_file": None,
+    "log_retention_days": 7,
 }
 
 # Known key types for validation: "int", "float", "str", "bool", "list".
@@ -50,6 +55,7 @@ _TYPED_KEYS = {
     "microbatch_max": "int", "microbatch_max_prompt": "int",
     "host": "str", "gemini_bl": "str", "default_model": "str",
     "impersonate": "str",
+    "log_file": "str", "log_retention_days": "int",
     "log_requests": "bool", "temporary_chats": "bool",
     "auto_delete_history": "bool",
     "api_keys": "list", "cookie_files": "list",

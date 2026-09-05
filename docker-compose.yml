@@ -11,6 +11,9 @@ services:
       # rw since 2026-09-04: the service persists upstream cookie renewals
       # back to this file, keeping the export fresh across restarts.
       - ./cookie_pro.txt:/app/cookie_pro.txt
+      # Local log sink: daily rotation, 7-day retention (log_file in
+      # config.json points here); greppable on the host directly.
+      - ./logs:/app/logs
     environment:
       TZ: Asia/Shanghai
     networks:

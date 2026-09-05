@@ -332,5 +332,50 @@ class StreamLatencyLogTests(unittest.TestCase):
         self.assertIn("attempt=1", line)
 
 
+class LocalLogFileTests(unittest.TestCase):
+    """Verify the optional rotating file sink: attach, format, gate."""
+
+    def setUp(self):
+        self.saved = dict(CONFIG)
+        import gemini_web2api.logs as logs_mod
+        self.logs_mod = logs_mod
+        logs_mod._file_handler = None
+        logs_mod._file_handler_path = None
+        import tempfile
+        self.tmpdir = tempfile.mkdtemp()
+        self.log_path = os.path.join(self.tmpdir, "sub", "service.log")
+
+    def tearDown(self):
+        import shutil
+        if self.logs_mod._file_handler is not None:
+            self.logs_mod._logger.removeHandler(self.logs_mod._file_handler)
+            self.logs_mod._file_handler.close()
+        self.logs_mod._file_handler = None
+        self.logs_mod._file_handler_path = None
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        CONFIG.clear()
+        CONFIG.update(self.saved)
+
+    def test_file_sink_writes_same_line_shape(self):
+        import io
+        CONFIG.update({"log_requests": True, "log_file": self.log_path})
+        stderr = io.StringIO()
+        with mock.patch.object(self.logs_mod.sys, "stderr", stderr):
+            self.logs_mod.log("hello file sink")
+        self.assertTrue(os.path.exists(self.log_path))
+        line = open(self.log_path, encoding="utf-8").read().strip()
+        self.assertRegex(line, r"^\[\d{2}:\d{2}:\d{2}\] hello file sink$")
+        self.assertIn("hello file sink", stderr.getvalue())
+
+    def test_log_requests_gate_silences_both_sinks(self):
+        import io
+        CONFIG.update({"log_requests": False, "log_file": self.log_path})
+        stderr = io.StringIO()
+        with mock.patch.object(self.logs_mod.sys, "stderr", stderr):
+            self.logs_mod.log("must not appear")
+        self.assertFalse(os.path.exists(self.log_path))
+        self.assertEqual(stderr.getvalue(), "")
+
+
 if __name__ == "__main__":
     unittest.main()
