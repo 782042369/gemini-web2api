@@ -6,7 +6,7 @@
 
 [中文文档](README_CN.md)
 
-Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, cross-platform, single file.
+Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, cross-platform, modular Python package.
 
 ## Features
 
@@ -16,16 +16,25 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 - **Multiple Models**: Flash (3.6), Extended Thinking (20k+ char output), Pro, Auto, Lite
 - **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
 - **Web Search**: Built-in internet access (Gemini's native search)
-- **Cross-Platform**: Pure Python, single optional dependency (`httpx` for streaming)
-- **Streaming**: SSE streaming support via `httpx`
+- **Cross-Platform**: Pure Python with a graceful transport ladder (`curl_cffi` Chrome fingerprint, `httpx`, stdlib `urllib`)
+- **Streaming**: SSE streaming via `httpx` / `curl_cffi`
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
 
 ## Quick Start
 
+From a source checkout:
+
 ```bash
-pip install httpx
-python gemini_web2api.py
+pip install -r requirements.txt
+PYTHONPATH=src python -m gemini_web2api
+```
+
+Or install as a package:
+
+```bash
+pip install .
+gemini-web2api
 ```
 
 Server starts at `http://localhost:8081/v1`.
@@ -113,7 +122,7 @@ gemini-3.5-flash-thinking@think=4   # shallowest
 Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, you need a **Gemini Advanced (paid subscription)** account cookie:
 
 ```bash
-python gemini_web2api.py --cookie-file cookie.txt
+python -m gemini_web2api --cookie-file cookie.txt
 ```
 
 ### How to get cookies
@@ -251,7 +260,7 @@ If you cannot access `gemini.google.com` directly (connection timeout), configur
 
 **Method 1: CLI argument**
 ```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
+python -m gemini_web2api --proxy http://127.0.0.1:7890
 ```
 
 **Method 2: config.json**
@@ -262,7 +271,7 @@ python gemini_web2api.py --proxy http://127.0.0.1:7890
 **Method 3: Environment variable** (auto-detected)
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:7890
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 Works with Clash, V2Ray, Shadowsocks, or any HTTP proxy.
@@ -312,8 +321,46 @@ resp = client.chat.completions.create(
 ## Requirements
 
 - Python 3.8+
-- `httpx` (`pip install httpx`) — used for streaming requests
+- `httpx` and `curl_cffi` (`pip install -r requirements.txt`); the service also degrades gracefully to stdlib `urllib` when both are absent
 - Network access to `gemini.google.com` (proxy/VPN may be needed in some regions)
+
+## Project Structure
+
+```
+src/gemini_web2api/
+├── __main__.py            # CLI entry point (python -m gemini_web2api)
+├── config.py              # defaults, JSON loading, validation
+├── logs.py                # single stderr logging gate
+├── models.py              # model catalog (MODE_CATEGORY mapping)
+├── upstream/              # Gemini Web protocol client
+│   ├── transport.py       #   curl_cffi / httpx / urllib ladder
+│   ├── cookies.py         #   multi-account cookie pool, round-robin
+│   ├── protocol.py        #   headers, f.req payload, endpoints
+│   ├── parser.py          #   wrb.fr response parsing
+│   ├── concurrency.py     #   FIFO concurrency cap
+│   ├── history.py         #   conversation deletion
+│   └── generate.py        #   retry / coalescing / streaming pipeline
+├── keepalive.py           # session self-renewal (RotateCookies, SNlM0e)
+├── multimodal.py          # two-step Scotty image upload
+├── tools.py               # OpenAI tool-call parsing
+├── batching.py            # micro-batching / batch translation
+└── server/                # HTTP API layer
+    ├── base.py            #   routing, auth, SSE, threaded server
+    ├── images.py          #   shared image upload helper
+    ├── openai_chat.py     #   /v1/chat/completions
+    ├── openai_responses.py#   /v1/responses (Codex CLI)
+    └── google.py          #   /v1beta generateContent (Gemini CLI)
+```
+
+## Development
+
+```bash
+make test     # unit tests (no network; upstream fully mocked)
+make lint     # ruff static checks
+make run      # dev server from the source tree
+```
+
+CI runs lint + tests on every push before publishing the Docker image.
 
 ## How It Works
 

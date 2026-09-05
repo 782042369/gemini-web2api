@@ -1,15 +1,15 @@
 """Multimodal: browser-aligned two-step Scotty resumable upload."""
-import base64
 import urllib.request
 import urllib.parse
 import time
-import ssl
 import re
-import uuid
 from urllib.parse import urlparse
 
 from .config import CONFIG
-from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log, get_browser_session, CHROME_UA
+from .logs import log
+from .upstream.cookies import load_cookie
+from .upstream.protocol import make_sapisidhash
+from .upstream.transport import CHROME_UA, _get_ssl_ctx, get_browser_session
 
 
 def _get_page_tokens() -> dict:

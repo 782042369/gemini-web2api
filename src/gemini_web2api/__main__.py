@@ -2,15 +2,23 @@
 import argparse
 import os
 
-from .config import CONFIG, load_config, find_config
-from .models import MODELS
-from .gemini import HAS_HTTPX, HAS_CURL_CFFI, start_keep_warm
-from .keepalive import start_keepalive
-from .server import GeminiHandler, ThreadedServer
 from . import __version__
+from .config import CONFIG, find_config, load_config
+from .keepalive import start_keepalive
+from .models import MODELS
+from .server import GeminiHandler, ThreadedServer
+from .upstream import HAS_CURL_CFFI, HAS_HTTPX, start_keep_warm
 
 
 def main():
+    """Parse CLI arguments, load configuration and serve forever.
+
+    Args:
+        None (reads sys.argv).
+
+    Returns:
+        None; blocks in serve_forever() until interrupted.
+    """
     parser = argparse.ArgumentParser(description="Gemini Web to OpenAI API")
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--config", type=str, default=None)

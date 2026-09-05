@@ -3,7 +3,9 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY gemini_web2api/ ./gemini_web2api/
+# Only the package itself enters the image (src/ layout); tests, docs and
+# deployment secrets stay out of the build context via .dockerignore.
+COPY src/gemini_web2api/ ./gemini_web2api/
 COPY config.example.json ./config.json
 EXPOSE 8081
 
