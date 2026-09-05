@@ -164,6 +164,32 @@ class MicroBatcherTests(unittest.TestCase):
             self.assertIsInstance(e["holder"]["error"], RuntimeError)
             self.assertIsNone(e["holder"]["result"])
 
+    @mock.patch("gemini_web2api.batching.log")
+    def test_run_batch_dispatch_line_lists_member_rids(self, log_mock):
+        batcher = _MicroBatcher(window=0.01, max_segments=4)
+        entries = [self._entry("k", "p%d" % i) for i in range(2)]
+        entries[0]["rid"] = "rid-aaaa1111"
+        entries[1]["rid"] = "rid-bbbb2222"
+        entries[0]["runner"] = lambda prompts: ["r-" + p for p in prompts]
+        entries[1]["runner"] = None
+        batcher._run_batch(entries)
+        dispatch = [str(c) for c in log_mock.call_args_list
+                    if "Microbatch dispatch" in str(c)]
+        self.assertEqual(len(dispatch), 1)
+        self.assertIn("2 segment(s) reqs=rid-aaaa1111,rid-bbbb2222", dispatch[0])
+
+    @mock.patch("gemini_web2api.batching.log")
+    def test_run_batch_dispatch_line_without_rids_unchanged(self, log_mock):
+        batcher = _MicroBatcher(window=0.01, max_segments=4)
+        entries = [self._entry("k", "solo")]
+        entries[0]["runner"] = lambda prompts: ["ok"]
+        batcher._run_batch(entries)
+        dispatch = [str(c) for c in log_mock.call_args_list
+                    if "Microbatch dispatch" in str(c)]
+        self.assertEqual(len(dispatch), 1)
+        self.assertIn("1 segment(s)", dispatch[0])
+        self.assertNotIn("reqs=", dispatch[0])
+
 
 class MicrobatchRunnerTests(unittest.TestCase):
     def setUp(self):
@@ -332,6 +358,27 @@ class StreamLatencyLogTests(unittest.TestCase):
         self.assertIn("attempt=1", line)
 
 
+def _reset_logs_singleton(logs_mod) -> None:
+    """Drop the shared logger so the next log() rebinds to the current stderr.
+
+    Server threads from earlier test classes may create the logger at an
+    arbitrary moment (binding the REAL stderr); resetting here makes the
+    sink-format test deterministic inside its patched-stderr window.
+
+    Args:
+        logs_mod: the gemini_web2api.logs module.
+
+    Returns:
+        None.
+    """
+    if logs_mod._logger is not None:
+        for handler in list(logs_mod._logger.handlers):
+            logs_mod._logger.removeHandler(handler)
+    logs_mod._logger = None
+    logs_mod._file_handler = None
+    logs_mod._file_handler_path = None
+
+
 class LocalLogFileTests(unittest.TestCase):
     """Verify the optional rotating file sink: attach, format, gate."""
 
@@ -339,8 +386,7 @@ class LocalLogFileTests(unittest.TestCase):
         self.saved = dict(CONFIG)
         import gemini_web2api.logs as logs_mod
         self.logs_mod = logs_mod
-        logs_mod._file_handler = None
-        logs_mod._file_handler_path = None
+        _reset_logs_singleton(logs_mod)
         import tempfile
         self.tmpdir = tempfile.mkdtemp()
         self.log_path = os.path.join(self.tmpdir, "sub", "service.log")
@@ -350,8 +396,7 @@ class LocalLogFileTests(unittest.TestCase):
         if self.logs_mod._file_handler is not None:
             self.logs_mod._logger.removeHandler(self.logs_mod._file_handler)
             self.logs_mod._file_handler.close()
-        self.logs_mod._file_handler = None
-        self.logs_mod._file_handler_path = None
+        _reset_logs_singleton(self.logs_mod)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         CONFIG.clear()
         CONFIG.update(self.saved)
@@ -375,6 +420,30 @@ class LocalLogFileTests(unittest.TestCase):
             self.logs_mod.log("must not appear")
         self.assertFalse(os.path.exists(self.log_path))
         self.assertEqual(stderr.getvalue(), "")
+
+
+def _wait_for(predicate, timeout: float = 2.0, interval: float = 0.02) -> bool:
+    """Poll until predicate() is true or timeout expires.
+
+    Access lines are emitted AFTER the response is sent (duration is only
+    known at request end), so a client-side assertion races the handler's
+    finally block; poll instead of assuming.
+
+    Args:
+        predicate: zero-arg callable returning truthy when satisfied.
+        timeout: maximum seconds to wait.
+        interval: poll interval in seconds.
+
+    Returns:
+        True when the predicate was satisfied, False on timeout.
+    """
+    import time as _time
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        if predicate():
+            return True
+        _time.sleep(interval)
+    return predicate()
 
 
 class RequestIdTests(unittest.TestCase):
@@ -421,8 +490,14 @@ class RequestIdTests(unittest.TestCase):
 
         self.assertEqual(resp.status, 200)
         self.assertEqual(headers.get("x-request-id"), "client-rid-42")
-        access = [str(c) for c in base_log.call_args_list
-                  if '"POST /v1/chat/completions HTTP/1.1"' in str(c)]
+
+        def access_lines():
+            return [str(c) for c in base_log.call_args_list
+                    if '"POST /v1/chat/completions HTTP/1.1"' in str(c)]
+
+        self.assertTrue(_wait_for(lambda: access_lines()),
+                        msg="access line not emitted in time")
+        access = access_lines()
         self.assertEqual(len(access), 1)
         self.assertIn("200 ", access[0])
         self.assertRegex(access[0], r"[0-9]\.\d{2}s")
@@ -445,9 +520,14 @@ class RequestIdTests(unittest.TestCase):
 
         echoed = headers.get("x-request-id", "")
         self.assertRegex(echoed, r"^[0-9a-f]{12}$")
-        access = [str(c) for c in base_log.call_args_list
-                  if '"POST /v1/chat/completions HTTP/1.1"' in str(c)]
-        self.assertEqual(len(access), 1)
+
+        def access_lines():
+            return [str(c) for c in base_log.call_args_list
+                    if '"POST /v1/chat/completions HTTP/1.1"' in str(c)]
+
+        self.assertTrue(_wait_for(lambda: access_lines()),
+                        msg="access line not emitted in time")
+        self.assertEqual(len(access_lines()), 1)
 
     @mock.patch("gemini_web2api.server.base.log")
     @mock.patch("gemini_web2api.server.openai_chat.generate", return_value="ok")

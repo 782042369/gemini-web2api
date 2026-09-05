@@ -9,7 +9,7 @@ import threading
 import time
 
 from .config import CONFIG
-from .logs import log
+from .logs import get_request_id, log
 from .upstream import generate
 
 
@@ -75,6 +75,10 @@ class _MicroBatcher:
         holder = {"event": ev, "result": None, "error": None}
         entry = dict(item)
         entry["holder"] = holder
+        # Correlate this segment with its originating HTTP request: the
+        # dispatcher thread has no thread-local id, so the id must travel
+        # with the entry into the batch log line.
+        entry["rid"] = get_request_id()
         with self._cv:
             self._pending.append(entry)
             self._cv.notify_all()
@@ -127,6 +131,12 @@ class _MicroBatcher:
             buckets.setdefault(entry["key"], []).append(entry)
         for entries in buckets.values():
             prompts = [e["prompt"] for e in entries]
+            rids = [e["rid"] for e in entries if e.get("rid")]
+            # Dispatch log moved here from the runner closure so the batch
+            # members' request ids can be listed (the dispatcher thread has
+            # no thread-local id of its own). Key text unchanged.
+            suffix = f" reqs={','.join(rids)}" if rids else ""
+            log(f"Microbatch dispatch: {len(prompts)} segment(s){suffix}")
             try:
                 results = entries[0]["runner"](prompts)
                 if len(results) != len(prompts):
@@ -223,7 +233,6 @@ def _microbatch_runner(model_id, think_mode, extra_fields, instruction=""):
 
     def _run(prompts):
         """Execute prompts - one upstream call when batched, else direct."""
-        log(f"Microbatch dispatch: {len(prompts)} segment(s)")
         if len(prompts) == 1:
             return [_direct(prompts[0])]
         body = "\n".join(f"[{i}] {s}" for i, s in enumerate(prompts))
