@@ -69,6 +69,10 @@ def _get_page_tokens() -> dict:
             ("push_id", r'"qKIAYe":"([^"]+)"'),
             ("pctx", r'"Ylro7b":"([^"]+)"'),
             ("at", r'"SNlM0e":"([^"]+)"'),
+            # f.sid binds StreamGenerate/ProcessFile to the live page session;
+            # bl is the freshest frontend build label (overrides config gemini_bl).
+            ("f_sid", r'"FdrFJe":"([^"]+)"'),
+            ("bl", r'"cfb2h":"([^"]+)"'),
         ]:
             m = re.search(pattern, html)
             if m:
@@ -108,7 +112,9 @@ def _cached_page_tokens() -> dict:
             cookie_mtime = os.path.getmtime(path) if path != "__anonymous__" else 0.0
         except OSError:
             cookie_mtime = 0.0
-        ttl = 600 if cache["tokens"].get("push_id") and cache["tokens"].get("at") else 30
+        # SNlM0e has been removed from the page upstream; push_id alone marks
+        # a usable token set (f_sid/bl ride along when present).
+        ttl = 600 if cache["tokens"].get("push_id") else 30
         if cache["ts"] is not None and now - cache["ts"] < ttl and cache["mtime"] == cookie_mtime:
             return dict(cache["tokens"])
         tokens = _get_page_tokens()
@@ -202,6 +208,60 @@ def _upload_post(url: str, headers: dict, data: bytes):
         return resp.status, heads, body
 
 
+def _upload_multipart_once(image_bytes: bytes, filename: str, mime_type: str, push_id: str):
+    """One-shot multipart upload to content-push.googleapis.com.
+
+    Browser-session (curl_cffi) only: shares the impersonated Chrome TLS
+    fingerprint with the generate path, matching the reference client
+    HanaokaYuzu/Gemini-API. Returns the file reference on success, or None
+    when this path is unavailable so the caller falls back to the resumable
+    two-step flow.
+
+    Parameters:
+        image_bytes: raw image bytes to upload.
+        filename: filename reported to Google.
+        mime_type: MIME type of the multipart part.
+        push_id: account page push id (qKIAYe token).
+
+    Returns:
+        File reference string (e.g. /contrib_service/ttl_1d/...) or None.
+    """
+    sess = get_browser_session()
+    if sess is None:
+        return None
+    try:
+        from curl_cffi import CurlMime
+    except ImportError:
+        return None
+    timeout = remaining_timeout(90, "image upload")
+    headers = {
+        "Origin": "https://gemini.google.com",
+        "Referer": "https://gemini.google.com/",
+        "X-Tenant-Id": "bard-storage",
+        "Push-ID": push_id,
+        "User-Agent": CHROME_UA,
+    }
+    mime = CurlMime()
+    try:
+        mime.addpart(name="file", content_type=mime_type,
+                     filename=_sanitize_upload_name(filename), data=image_bytes)
+        with curl_total_timeout(sess, timeout):
+            resp = sess.post("https://content-push.googleapis.com/upload",
+                             headers=headers, multipart=mime, timeout=timeout)
+            body = resp.text
+        if resp.status_code == 200 and body.strip().startswith("/"):
+            log(f"Image uploaded via content-push multipart: {body.strip()[:60]}")
+            return body.strip()
+        log(f"content-push multipart not usable: HTTP {resp.status_code} {body[:80]}")
+        return None
+    except Exception as exc:  # transport failure -> resumable fallback
+        check_budget("image upload")
+        log(f"content-push multipart failed ({exc}); falling back to resumable")
+        return None
+    finally:
+        mime.close()
+
+
 def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str = "image/png") -> str:
     """Upload an image via the browser-aligned two-step Scotty resumable flow.
 
@@ -235,6 +295,12 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
             "upload aborted: page push_id unavailable - references uploaded "
             "without it are rejected by StreamGenerate (BardErrorInfo 1100)")
     pctx = tokens.get("pctx")
+
+    # Preferred path (2026-09): one-shot multipart to content-push in the
+    # form HanaokaYuzu/Gemini-API uses; resumable two-step stays as fallback.
+    ref = _upload_multipart_once(image_bytes, filename, mime_type, push_id)
+    if ref:
+        return ref
 
     cookie_str, sapisid = load_cookie()
     check_budget("image session refresh")

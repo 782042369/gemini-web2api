@@ -6,6 +6,12 @@ semver.
 
 ## [Unreleased]
 
+### Browser-parity hardening (2026-09-08, from HanaokaYuzu/Gemini-API)
+
+- StreamGenerate now sends the live page session id as `f.sid` and the freshest frontend build label (`cfb2h`) instead of the static config `gemini_bl`, plus the model-selection envelope headers (`x-goog-ext-525001261-jspb`, `73010989`, `73010990`).
+- Image upload prefers a one-shot multipart POST to `content-push.googleapis.com` (the reference client's form) and keeps the two-step Scotty resumable flow as an automatic fallback.
+- Page-token cache now also captures `FdrFJe`/`cfb2h`; its TTL no longer depends on the removed `SNlM0e`. Default and config impersonation pinned to `chrome145` to avoid Google's Device Bound Session Credentials experiment.
+
 ### Pending: retry, deadline and translation-batch optimization
 
 - Classify transient HTTP/transport failures using metadata; stop unchanged Bard refusals, permanent failures, and all retries after streamed text. Honor Retry-After within a single request budget.

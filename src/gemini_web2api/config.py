@@ -33,7 +33,9 @@ DEFAULT_CONFIG = {
     "auto_delete_history": False,
     "keep_warm_interval_sec": 0,
     "slow_retry_sec": 60,
-    "impersonate": "chrome",
+    # chrome145 pins the profile HanaokaYuzu/Gemini-API uses to avoid
+    # Google's Device Bound Session Credentials experiment on newer profiles.
+    "impersonate": "chrome145",
     # Transparent micro-batching of short single-segment generateContent
     # requests (companion plugins firing burst translations). 0 disables.
     # Active session keepalive: rotate PSIDTS + refresh SNlM0e every N

@@ -473,12 +473,57 @@ class GenerationBudgetTests(unittest.TestCase):
         with mock.patch("gemini_web2api.budget.time.monotonic", side_effect=lambda: clock[0]), \
                 mock.patch.object(multimodal, "get_browser_session", return_value=session), \
                 mock.patch.object(multimodal, "_cached_page_tokens", return_value={"push_id": "p"}), \
+                mock.patch.object(multimodal, "_upload_multipart_once", return_value=None), \
                 mock.patch.object(multimodal, "load_cookie", return_value=("", None)), \
                 mock.patch.object(multimodal, "_active_auth_user", return_value=None), \
                 budget_scope(RequestBudget(seconds=5)):
             self.assertEqual(multimodal.upload_image(b"image"), "/contrib_service/file")
         self.assertEqual(timeouts, [5, 3])
         self.assertTrue(all(r.close.called for r in responses))
+
+    def test_upload_prefers_content_push_multipart(self):
+        """Multipart one-shot wins when content-push accepts it. Args: None. Returns: None."""
+        from gemini_web2api import multimodal
+        response = SimpleNamespace(status_code=200, text="/contrib_service/multipart-ref", close=mock.Mock())
+        session = SimpleNamespace(
+            post=mock.Mock(return_value=response), curl_options={})
+        with mock.patch.object(multimodal, "get_browser_session", return_value=session), \
+                mock.patch.object(multimodal, "_cached_page_tokens",
+                                  return_value={"push_id": "p"}), \
+                mock.patch.object(multimodal, "load_cookie", return_value=("", None)), \
+                mock.patch.object(multimodal, "_active_auth_user", return_value=None), \
+                budget_scope(RequestBudget(seconds=30)):
+            self.assertEqual(multimodal.upload_image(b"image"), "/contrib_service/multipart-ref")
+        url = session.post.call_args[0][0]
+        self.assertIn("content-push.googleapis.com", url)
+
+    def test_upload_multipart_failure_falls_back_to_resumable(self):
+        """A rejected multipart upload falls back to the two-step flow. Args: None. Returns: None."""
+        from gemini_web2api import multimodal
+        multipart_resp = SimpleNamespace(status_code=403, text="denied", close=mock.Mock())
+        step_responses = [SimpleNamespace(status_code=200,
+                                          headers={"x-goog-upload-url": "https://push.clients6.google.com/f"},
+                                          text="", close=mock.Mock()),
+                          SimpleNamespace(status_code=200, headers={},
+                                          text="/contrib_service/resumed", close=mock.Mock())]
+        calls = []
+
+        def post(url, *args, **kwargs):
+            """Route by URL: multipart first, then resumable steps. Args: URL. Returns: response."""
+            calls.append(url)
+            if "content-push" in url:
+                return multipart_resp
+            return step_responses[len([c for c in calls if "content-push" not in c]) - 1]
+
+        session = SimpleNamespace(post=post, curl_options={})
+        with mock.patch.object(multimodal, "get_browser_session", return_value=session), \
+                mock.patch.object(multimodal, "_cached_page_tokens",
+                                  return_value={"push_id": "p"}), \
+                mock.patch.object(multimodal, "load_cookie", return_value=("", None)), \
+                mock.patch.object(multimodal, "_active_auth_user", return_value=None), \
+                budget_scope(RequestBudget(seconds=30)):
+            self.assertEqual(multimodal.upload_image(b"image"), "/contrib_service/resumed")
+        self.assertEqual(len(calls), 3)
 
     def test_download_budget_errors_are_not_swallowed_as_empty_bytes(self):
         """Keep total deadline failure distinct from bad images. Args: None. Returns: None."""

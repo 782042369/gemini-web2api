@@ -59,6 +59,12 @@ def _build_headers(uuid_val: str = None) -> dict:
         "Referer": f"https://gemini.google.com{account_prefix}/app",
         "X-Same-Domain": "1",
         "User-Agent": CHROME_UA,
+        # Model-selection envelope headers observed on the real web client
+        # and HanaokaYuzu/Gemini-API; neutral values are accepted upstream.
+        "x-goog-ext-525001261-jspb": ("[1,null,null,null,null,null,null,null,"
+                                       "[4,5,6,8],null,null,null,null,null,null,null]"),
+        "x-goog-ext-73010989-jspb": "[0]",
+        "x-goog-ext-73010990-jspb": "[0,0,0]",
     }
     if uuid_val:
         headers["x-goog-ext-525005358-jspb"] = f'["{uuid_val}",1]'
@@ -148,19 +154,37 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
 def _get_url() -> str:
     """Construct the generation endpoint for the resolved active account.
 
+    The freshest frontend build label from the live app page (cfb2h)
+    overrides the configured gemini_bl, and the page session id (FdrFJe) is
+    appended as f.sid — the request form the reference client
+    HanaokaYuzu/Gemini-API sends. Token cache failures silently fall back
+    to the static config values.
+
     Args:
         None.
 
     Returns:
-        StreamGenerate URL with build and request-id parameters.
+        StreamGenerate URL with build, session and request-id parameters.
     """
     reqid = int(time.time() * 1000) % 1000000
     account_prefix = _account_prefix()
-    return (
+    bl = CONFIG['gemini_bl']
+    fsid = None
+    try:
+        from ..multimodal import _cached_page_tokens  # lazy: avoid import cycle
+        tokens = _cached_page_tokens()
+        bl = tokens.get("bl") or bl
+        fsid = tokens.get("f_sid")
+    except Exception:
+        pass
+    url = (
         f"https://gemini.google.com{account_prefix}/_/BardChatUi/data/"
         "assistant.lamda.BardFrontendService/StreamGenerate"
-        f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
+        f"?bl={bl}&hl=en&_reqid={reqid}&rt=c"
     )
+    if fsid:
+        url += f"&f.sid={fsid}"
+    return url
 
 
 def _delete_url() -> str:
