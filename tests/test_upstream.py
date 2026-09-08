@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from unittest import mock
+from urllib.parse import parse_qs
 
 from gemini_web2api.batching import (_MicroBatcher, _extract_batch_segments,
                                      _microbatch_eligible, _microbatch_runner)
@@ -17,7 +18,7 @@ from gemini_web2api.models import resolve_model
 from gemini_web2api.upstream import cookies as cookies_mod
 from gemini_web2api.upstream.generate import _retry_delay
 from gemini_web2api.upstream.parser import clean_text, extract_response_text
-from gemini_web2api.upstream.protocol import _build_headers, make_sapisidhash
+from gemini_web2api.upstream.protocol import _build_headers, _build_payload, make_sapisidhash
 
 
 def _wrb_line(texts, cid="c_test"):
@@ -32,6 +33,56 @@ def _wrb_line(texts, cid="c_test"):
     """
     inner = [None, [cid, "r_id"], None, None, [[None, list(texts)]]]
     return json.dumps([["wrb.fr", None, json.dumps(inner), None, None]])
+
+
+class AccountIsolationTests(unittest.TestCase):
+    """Ensure pooled cookie accounts never share session state."""
+
+    def setUp(self):
+        self.saved = dict(CONFIG)
+        self.a = tempfile.NamedTemporaryFile("w", suffix="-a.json", delete=False)
+        self.b = tempfile.NamedTemporaryFile("w", suffix="-b.json", delete=False)
+        self.a.write(json.dumps({"cookie": "SID=A; SAPISID=SA", "sapisid": "SA"}))
+        self.b.write(json.dumps({"cookie": "SID=B; SAPISID=SB", "sapisid": "SB"}))
+        self.a.close()
+        self.b.close()
+        CONFIG.update({"cookie_file": None, "cookie_files": [self.a.name, self.b.name], "xsrf_token": "fallback"})
+        cookies_mod._cookie_caches.clear()
+        cookies_mod._account_state.clear()
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.saved)
+        cookies_mod.restore_active_cookie(None)
+        cookies_mod._cookie_caches.clear()
+        cookies_mod._account_state.clear()
+        for path in (self.a.name, self.b.name):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def test_xsrf_payload_is_account_scoped(self):
+        cookies_mod.set_active_cookie(self.a.name)
+        cookies_mod.set_active_xsrf_token("token-a")
+        body_a = _build_payload("a", 1, 4)
+        cookies_mod.set_active_cookie(self.b.name)
+        body_b_before = _build_payload("b", 1, 4)
+        cookies_mod.set_active_xsrf_token("token-b")
+        body_b = _build_payload("b", 1, 4)
+        self.assertEqual(parse_qs(body_a)["at"][0], "token-a")
+        self.assertNotIn("at", parse_qs(body_b_before))
+        self.assertEqual(parse_qs(body_b)["at"][0], "token-b")
+
+    def test_concurrency_semaphores_are_account_scoped(self):
+        CONFIG["max_concurrent_requests"] = 1
+        from gemini_web2api.upstream import concurrency
+        concurrency._upstream_semaphores.clear()
+        cookies_mod.set_active_cookie(self.a.name)
+        sem_a = concurrency._get_semaphore()
+        cookies_mod.set_active_cookie(self.b.name)
+        sem_b = concurrency._get_semaphore()
+        self.assertIsNot(sem_a, sem_b)
 
 
 class ResponseParsingTests(unittest.TestCase):
@@ -322,6 +373,9 @@ class StreamLatencyLogTests(unittest.TestCase):
     """Lock the 'Upstream stream:' log format - production greps depend on it."""
 
     def setUp(self):
+        refresh = mock.patch("gemini_web2api.upstream.generate._refresh_xsrf")
+        refresh.start()
+        self.addCleanup(refresh.stop)
         self.saved = dict(CONFIG)
         CONFIG.update({
             "retry_attempts": 1, "log_requests": True,
@@ -408,7 +462,8 @@ class LocalLogFileTests(unittest.TestCase):
         with mock.patch.object(self.logs_mod.sys, "stderr", stderr):
             self.logs_mod.log("hello file sink")
         self.assertTrue(os.path.exists(self.log_path))
-        line = open(self.log_path, encoding="utf-8").read().strip()
+        with open(self.log_path, encoding="utf-8") as log_file:
+            line = log_file.read().strip()
         self.assertRegex(line, r"^\[\d{2}:\d{2}:\d{2}\] hello file sink$")
         self.assertIn("hello file sink", stderr.getvalue())
 

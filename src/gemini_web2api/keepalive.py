@@ -7,20 +7,26 @@ PSIDTS). See gemini.py for the request pipeline that calls back into
 _renew_cookies/_refresh_xsrf here.
 """
 import json
+import math
 import os
 import threading
 import time
 import urllib.request
 
 from .config import CONFIG
+from .budget import RequestControlError
 from .logs import log
 from .upstream import generate
-from .upstream.cookies import _active_cookie_path, _cookie_caches, load_cookie
+from .upstream.cookies import (
+    _active_cookie_path, _cookie_paths, _cookie_caches,
+    _cookie_lock as _cookie_write_lock,
+    get_active_xsrf_token, load_cookie, set_active_cookie,
+    set_active_xsrf_token, restore_active_cookie,
+)
 from .upstream.transport import CHROME_UA, _get_ssl_ctx, get_browser_session
 
 
-_cookie_write_lock = threading.Lock()
-_last_cookie_persist = {"t": 0.0}
+_last_cookie_persist = {}  # cookie path -> last disk persistence timestamp
 
 
 def _parse_set_cookies(resp) -> dict:
@@ -54,70 +60,85 @@ def _parse_set_cookies(resp) -> dict:
     return pairs
 
 
-def _persist_cookie_file(cookie_file: str, cookie_str: str, sapisid, auth_user,
-                         min_interval: float = 300.0) -> None:
-    """Write the renewed cookie back to its JSON file, in place and throttled.
-
-    The cookie file is a single-file bind mount, so rename(2)-based atomic
-    replace fails (EBUSY); instead an in-place truncate+write guarded by a
-    lock is used, with fsync. Any failure is logged and non-fatal.
+def _write_cookie_data(cookie_file: str, data: dict) -> None:
+    """Flush a prepared cookie document and publish its matching cache.
 
     Args:
-        cookie_file: path of the cookie JSON file (as seen in-container).
-        cookie_str: merged Cookie header string to persist.
-        sapisid: current SAPISID value (kept as-is when None).
-        auth_user: per-account auth_user override (kept as-is when None).
-        min_interval: minimum seconds between two disk writes (throttle).
+        cookie_file: Destination file, including single-file bind mounts.
+        data: Complete JSON document; caller holds _cookie_write_lock for
+            the entire read/modify/write transaction.
+
+    Returns:
+        None. Errors propagate without advancing cache mtime or throttles.
+    """
+    serialized = json.dumps(data, ensure_ascii=False)
+    with open(cookie_file, "w", encoding="utf-8") as f:
+        f.write(serialized)
+        f.flush()
+        os.chmod(cookie_file, 0o600)
+        os.fsync(f.fileno())
+    mtime = os.path.getmtime(cookie_file)
+    cookie_str = data.get("cookie", "")
+    pairs = dict(p.strip().split("=", 1) for p in cookie_str.split(";") if "=" in p)
+    _cookie_caches[cookie_file] = {
+        "str": cookie_str,
+        "sapisid": data.get("sapisid") or pairs.get("SAPISID") or None,
+        "auth_user": data.get("auth_user"),
+        "xsrf_token": data.get("xsrf_token"),
+        "mtime": mtime,
+    }
+
+
+def _persist_cookie_file(cookie_file: str, cookie_str: str, sapisid, auth_user,
+                         min_interval: float = 300.0) -> None:
+    """Persist renewed cookies in place, serialized with all other readers/writers.
+
+    Single-file bind mounts cannot be replaced by rename(2). Serialize
+    in-process read/modify/write transactions and fsync before publishing
+    cache metadata. Failures remain non-fatal and do not consume the throttle.
+
+    Args:
+        cookie_file: Cookie JSON/text file to update.
+        cookie_str: Merged Cookie header string to persist.
+        sapisid: Current SAPISID value, or None to preserve the stored value.
+        auth_user: Per-account index, or None to preserve the stored value.
+        min_interval: Minimum seconds between successful writes per account.
 
     Returns:
         None.
     """
     with _cookie_write_lock:
         now = time.time()
-        if now - _last_cookie_persist["t"] < min_interval:
+        last_persisted = _last_cookie_persist.get(cookie_file)
+        if last_persisted is not None and now - last_persisted < min_interval:
             return
         try:
             data = {}
             if os.path.exists(cookie_file):
-                with open(cookie_file, "r") as f:
+                with open(cookie_file, "r", encoding="utf-8") as f:
                     content = f.read().strip()
                 if content.startswith("{"):
                     data = json.loads(content)
             data["cookie"] = cookie_str
-            if sapisid:
+            if sapisid is not None:
                 data["sapisid"] = sapisid
             if auth_user is not None:
                 data["auth_user"] = auth_user
-            with open(cookie_file, "w") as f:
-                f.write(json.dumps(data, ensure_ascii=False))
-                f.flush()
-                os.fsync(f.fileno())
-            os.chmod(cookie_file, 0o600)
-            _last_cookie_persist["t"] = now
-            cache = _cookie_caches.get(cookie_file)
-            if cache is not None:
-                try:
-                    cache["mtime"] = os.path.getmtime(cookie_file)
-                except OSError:
-                    pass
+            _write_cookie_data(cookie_file, data)
+            _last_cookie_persist[cookie_file] = now
             log(f"Cookie persisted to {cookie_file}")
         except Exception as e:
             log(f"Cookie persist error: {e}")
 
 
 def _merge_response_cookies(resp) -> None:
-    """Merge upstream Set-Cookie renewals into the active cookie cache.
-
-    Google rotates short-lived session tokens (SIDCC / PSIDTS / OSID ...)
-    via Set-Cookie during normal traffic. Merging them keeps the in-memory
-    cookie fresh and (throttled) persisted, so container restarts no longer
-    fall back to a stale export from the sync extension.
+    """Merge Set-Cookie renewals without losing concurrent account updates.
 
     Args:
-        resp: upstream response object whose Set-Cookie headers to merge.
+        resp: Upstream response whose Set-Cookie headers to merge.
 
     Returns:
-        None. Failures are swallowed (best-effort renewal).
+        None. In-memory renewals survive throttled or failed persistence.
     """
     try:
         updates = _parse_set_cookies(resp)
@@ -128,62 +149,85 @@ def _merge_response_cookies(resp) -> None:
     cookie_file = _active_cookie_path()
     if not cookie_file:
         return
-    cache = _cookie_caches.get(cookie_file)
-    if not cache or not cache.get("str"):
-        return
-    existing = dict(p.split("=", 1) for p in cache["str"].split("; ") if "=" in p)
-    if all(existing.get(k) == v for k, v in updates.items()):
-        return
-    existing.update(updates)
-    new_str = "; ".join(f"{k}={v}" for k, v in existing.items())
-    sapisid = updates.get("SAPISID") or cache.get("sapisid")
-    _cookie_caches[cookie_file] = {
-        "str": new_str,
-        "sapisid": sapisid,
-        "auth_user": cache.get("auth_user"),
-        "mtime": cache.get("mtime", 0),
-    }
-    log(f"Cookie renewed upstream ({len(updates)}): {', '.join(sorted(updates)[:5])}")
-    _persist_cookie_file(cookie_file, new_str, sapisid, cache.get("auth_user"))
+    with _cookie_write_lock:
+        load_cookie()
+        cache = _cookie_caches.get(cookie_file)
+        if not cache or not cache.get("str"):
+            return
+        existing = dict(p.strip().split("=", 1) for p in cache["str"].split(";") if "=" in p)
+        if all(existing.get(k) == v for k, v in updates.items()):
+            return
+        existing.update(updates)
+        new_str = "; ".join(f"{k}={v}" for k, v in existing.items())
+        sapisid = updates.get("SAPISID", cache.get("sapisid"))
+        _cookie_caches[cookie_file] = dict(cache, str=new_str, sapisid=sapisid)
+        log(f"Cookie renewed upstream ({len(updates)}): {', '.join(sorted(updates)[:5])}")
+        _persist_cookie_file(cookie_file, new_str, sapisid, cache.get("auth_user"))
 
 
-_xsrf_refreshed_at = 0.0
+_xsrf_refreshed_at = {}  # cookie path -> last page-token refresh timestamp
 
 
 def _maybe_refresh_xsrf():
-    """Refresh CONFIG xsrf_token from the live app page (throttled).
+    """Refresh the active account XSRF token from its live app page.
 
     The at= parameter binds a StreamGenerate request to the account's
     CURRENT session. A stale at (from an exported cookie snapshot)
     still passes plain-text generation, but uploaded-file references fail
     session binding with BardErrorInfo [1100] - the file "does not belong"
     to the session named by the old token. The live page always carries
-    the current token (WIZ_global_data thykhd), so pulling from there
+    the current token (WIZ_global_data SNlM0e), so pulling from there
     (at most every 300s) keeps at= aligned with the account session.
 
+    Args:
+        None.
+
     Returns:
-        None; updates CONFIG["xsrf_token"] in place and logs the change.
+        None; updates only the active account token and logs the change.
     """
-    global _xsrf_refreshed_at
-    if time.time() - _xsrf_refreshed_at < 300:
+    path = _active_cookie_path() or "__anonymous__"
+    now = time.time()
+    if now - _xsrf_refreshed_at.get(path, 0.0) < 300:
         return
-    _xsrf_refreshed_at = time.time()
+    _xsrf_refreshed_at[path] = now
     try:
         from .multimodal import _cached_page_tokens
         at = _cached_page_tokens().get("at")
-        if at and at.startswith("AOvx") and at != CONFIG.get("xsrf_token"):
-            old = (CONFIG.get("xsrf_token") or "")[:10]
-            CONFIG["xsrf_token"] = at
-            log(f"xsrf_token refreshed from page: {old}... -> {at[:10]}...")
+        current = get_active_xsrf_token()
+        if at and at.startswith("AOvx") and at != current:
+            old = (current or "")[:10]
+            set_active_xsrf_token(at)
+            log(f"xsrf_token refreshed for {path}: {old}... -> {at[:10]}...")
+    except RequestControlError:
+        raise
     except Exception as e:
-        log(f"xsrf refresh failed: {e}")
+        log(f"xsrf refresh failed for {path}: {e}")
 
 
 _keepalive_lock = threading.Lock()
 _keepalive_on = {"started": False}
 
 
-def _rotate_psidts() -> bool:
+def _rotate_psidts(cookie_file=None) -> bool:
+    """Rotate one configured account while preserving thread-local context.
+
+    Args:
+        cookie_file: Explicit account file; defaults to the active account.
+
+    Returns:
+        True when the account rotation completed successfully.
+    """
+    path = cookie_file or _active_cookie_path()
+    if not path:
+        return False
+    previous = set_active_cookie(path)
+    try:
+        return _rotate_psidts_active()
+    finally:
+        restore_active_cookie(previous)
+
+
+def _rotate_psidts_active() -> bool:
     """Actively rotate short-lived session cookies via Google's RotateCookies.
 
     Mirrors HanaokaYuzu/Gemini-API rotate_1psidts: one lightweight POST to
@@ -191,6 +235,9 @@ def _rotate_psidts() -> bool:
     session cookies (PSIDTS etc.) via Set-Cookie. The response is fed
     through the existing renewal path (in-memory merge + throttled
     persist), so the on-disk cookie file stays fresh.
+
+    Args:
+        None.
 
     Returns:
         True when the rotation completed with a 200 response.
@@ -206,12 +253,13 @@ def _rotate_psidts() -> bool:
     # export when present; a gemini-domain-only cookie jar gets 401.
     rotate_cookie = cookie_str
     try:
-        with open(cookie_file, "r") as f:
-            content = f.read().strip()
-        if content.startswith("{"):
-            acct = json.loads(content).get("accounts_cookie") or ""
-            if acct.strip():
-                rotate_cookie = acct.strip()
+        with _cookie_write_lock:
+            with open(cookie_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if content.startswith("{"):
+                acct = json.loads(content).get("accounts_cookie") or ""
+                if acct.strip():
+                    rotate_cookie = acct.strip()
     except (OSError, ValueError):
         pass
     headers = {
@@ -270,26 +318,37 @@ def _sync_accounts_cookie(resp) -> None:
     cookie_file = _active_cookie_path() or CONFIG.get("cookie_file")
     if not cookie_file:
         return
-    try:
-        with open(cookie_file, "r") as f:
-            content = f.read().strip()
-        if not content.startswith("{"):
-            return
-        data = json.loads(content)
-        acct = data.get("accounts_cookie") or ""
-        if not acct.strip():
-            return
-        pairs = dict(p.split("=", 1) for p in acct.split("; ") if "=" in p)
-        changed = {k: v for k, v in updates.items() if k in pairs and pairs[k] != v}
-        if not changed:
-            return
-        pairs.update(changed)
-        data["accounts_cookie"] = "; ".join(f"{k}={v}" for k, v in pairs.items())
-        with open(cookie_file, "w") as f:
-            f.write(json.dumps(data, ensure_ascii=False))
-        log(f"accounts_cookie renewed ({len(changed)}): {', '.join(sorted(changed)[:4])}")
-    except Exception as e:
-        log(f"accounts_cookie sync failed: {e}")
+    with _cookie_write_lock:
+        try:
+            load_cookie()
+            with open(cookie_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if not content.startswith("{"):
+                return
+            data = json.loads(content)
+            acct = data.get("accounts_cookie") or ""
+            if not acct.strip():
+                return
+            pairs = dict(p.strip().split("=", 1) for p in acct.split(";") if "=" in p)
+            changed = {k: v for k, v in updates.items() if k in pairs and pairs[k] != v}
+            if not changed:
+                return
+            pairs.update(changed)
+            data["accounts_cookie"] = "; ".join(f"{k}={v}" for k, v in pairs.items())
+            cache = _cookie_caches.get(cookie_file)
+            if cache and cache.get("mtime") == os.path.getmtime(cookie_file):
+                # Include renewals that the main-cookie throttle left in RAM;
+                # otherwise our new mtime would mark stale disk data as fresh.
+                data["cookie"] = cache["str"]
+                if cache.get("sapisid") is not None:
+                    data["sapisid"] = cache["sapisid"]
+                if cache.get("auth_user") is not None:
+                    data["auth_user"] = cache["auth_user"]
+            _write_cookie_data(cookie_file, data)
+            _last_cookie_persist[cookie_file] = time.time()
+            log(f"accounts_cookie renewed ({len(changed)}): {', '.join(sorted(changed)[:4])}")
+        except Exception as e:
+            log(f"accounts_cookie sync failed: {e}")
 
 
 def _generate_heartbeat() -> bool:
@@ -299,6 +358,9 @@ def _generate_heartbeat() -> bool:
     session cookies (PSIDTS) via Set-Cookie; a tiny prompt keeps each
     tick at a few tokens. The call goes through the normal pipeline, so
     cookie renewal, the slow-walk breaker and retries all apply.
+
+    Args:
+        None.
 
     Returns:
         True when the heartbeat generate succeeded.
@@ -312,34 +374,42 @@ def _generate_heartbeat() -> bool:
 
 
 def start_keepalive():
-    """Start the background session-keepalive loop (idempotent, once).
+    """Start one keepalive worker only when configuration enables it.
 
-    Every keepalive_sec (default 540s) the daemon thread actively rotates
-    the short-lived session cookies (PSIDTS) and refreshes the SNlM0e
-    xsrf token. This keeps the exported cookie file fresh even during
-    idle periods, so restarts never fall back to a stale export and the
-    browser-side re-export workflow becomes unnecessary.
+    Args:
+        None.
 
     Returns:
-        None; disabled silently when keepalive_sec <= 0 or no cookie file.
+        None. Disabled/invalid configurations leave startup retryable, as
+        does a failure to create or start the daemon thread.
     """
+    def _loop():
+        """Rotate every configured account once per keepalive interval.
+
+        Args:
+            None.
+
+        Returns:
+            Never normally returns; the daemon stops with the process.
+        """
+        while True:
+            time.sleep(interval)
+            for path in _cookie_paths():
+                try:
+                    ok = _rotate_psidts(path)
+                    log(f"Keepalive tick: account={path} rotate={'ok' if ok else 'failed'}")
+                except Exception as e:
+                    log(f"Keepalive loop error for {path}: {e}")
+
     with _keepalive_lock:
         if _keepalive_on["started"]:
             return
+        try:
+            interval = float(CONFIG.get("keepalive_sec") or 0)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(interval) or interval <= 0 or not _cookie_paths():
+            return
+        threading.Thread(target=_loop, daemon=True, name="session-keepalive").start()
         _keepalive_on["started"] = True
-    interval = float(CONFIG.get("keepalive_sec") or 0)
-    if interval <= 0 or not (CONFIG.get("cookie_file") or CONFIG.get("cookie_files")):
-        return
-
-    def _loop():
-        while True:
-            time.sleep(interval)
-            try:
-                ok = _rotate_psidts()
-                log(f"Keepalive tick: rotate={'ok' if ok else 'failed'}")
-            except Exception as e:
-                log(f"Keepalive loop error: {e}")
-
-    threading.Thread(target=_loop, daemon=True, name="session-keepalive").start()
     log(f"Keepalive started: every {interval:.0f}s")
-

@@ -184,13 +184,15 @@ class StreamingEndpointTests(unittest.TestCase):
         CONFIG.clear()
         CONFIG.update(self.original_config)
 
-    def post_json(self, path, payload):
+    def post_json(self, path, payload, headers=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        request_headers = {"Content-Type": "application/json"}
+        request_headers.update(headers or {})
         connection.request(
             "POST",
             path,
             body=json.dumps(payload),
-            headers={"Content-Type": "application/json"},
+            headers=request_headers,
         )
         response = connection.getresponse()
         body = response.read().decode()
@@ -203,8 +205,8 @@ class StreamingEndpointTests(unittest.TestCase):
         connection.request(
             "POST",
             path,
-            body=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
+            body=iter([json.dumps(payload).encode()]),
+            headers={"Content-Type": "application/json", "Transfer-Encoding": "chunked"},
             encode_chunked=True,
         )
         response = connection.getresponse()
@@ -371,8 +373,8 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "text/event-stream")
         self.assertIn('"text": "streamed"', body)
 
-    @mock.patch("gemini_web2api.server.openai_responses.generate", return_value="hello")
-    def test_responses_text_stream_has_complete_event_sequence(self, _generate):
+    @mock.patch("gemini_web2api.server.openai_responses.generate_stream", return_value=iter(["he", "llo"]))
+    def test_responses_text_stream_has_complete_event_sequence(self, _generate_stream):
         status, headers, body = self.post_json(
             "/v1/responses",
             {
@@ -393,6 +395,7 @@ class StreamingEndpointTests(unittest.TestCase):
                 "response.output_item.added",
                 "response.content_part.added",
                 "response.output_text.delta",
+                "response.output_text.delta",
                 "response.output_text.done",
                 "response.content_part.done",
                 "response.output_item.done",
@@ -403,7 +406,8 @@ class StreamingEndpointTests(unittest.TestCase):
             [event["sequence_number"] for _, event in events],
             list(range(1, len(events) + 1)),
         )
-        self.assertEqual(events[4][1]["delta"], "hello")
+        self.assertEqual(events[4][1]["delta"], "he")
+        self.assertEqual(events[5][1]["delta"], "llo")
         self.assertEqual(events[-1][1]["response"]["status"], "completed")
         self.assertEqual(events[-1][1]["response"]["output"][0]["content"][0]["text"], "hello")
 
@@ -462,6 +466,48 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(events[3][1]["delta"], '{"city":"Shanghai"}')
         self.assertEqual(events[4][1]["arguments"], '{"city":"Shanghai"}')
         self.assertEqual(events[-1][1]["response"]["output"][0]["name"], "get_weather")
+
+
+    @mock.patch("gemini_web2api.server.google.generate")
+    def test_non_api_generate_path_cannot_bypass_auth(self, generate):
+        """Reject arbitrary colon routes without invoking the upstream."""
+        CONFIG["api_keys"] = ["secret"]
+        status, _, body = self.post_json(
+            "/evil:generateContent",
+            {"contents": [{"parts": [{"text": "probe"}]}]},
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(generate.call_count, 0)
+        self.assertEqual(json.loads(body)["error"]["code"], "not_found")
+
+    @mock.patch("gemini_web2api.server.openai_chat.generate", return_value="ok")
+    def test_api_query_and_case_insensitive_bearer_are_accepted(self, generate):
+        """Accept harmless query strings and standard Bearer casing."""
+        CONFIG["api_keys"] = ["secret"]
+        status, _, body = self.post_json(
+            "/v1/chat/completions?trace=1",
+            {"model": "gemini-3.6-flash", "messages": [{"role": "user", "content": "hi"}]},
+            {"Authorization": "bearer secret"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["choices"][0]["message"]["content"], "ok")
+        generate.assert_called_once()
+
+    def test_scalar_json_body_returns_structured_400(self):
+        """Reject null/list JSON before handlers can raise AttributeError."""
+        status, headers, body = self.post_json("/v1/chat/completions", None)
+        self.assertEqual(status, 400)
+        self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
+        error = json.loads(body)["error"]
+        self.assertEqual(error["type"], "invalid_request_error")
+        self.assertEqual(error["param"], "body")
+
+    def test_oversized_body_returns_413(self):
+        """Reject oversized bodies before allocating/parsing their payload."""
+        CONFIG["max_request_body_bytes"] = 4
+        status, _, body = self.post_json("/v1/chat/completions", {"x": "too large"})
+        self.assertEqual(status, 413)
+        self.assertEqual(json.loads(body)["error"]["code"], "request_too_large")
 
 
 if __name__ == "__main__":

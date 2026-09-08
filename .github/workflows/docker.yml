@@ -4,6 +4,8 @@ on:
   push:
     branches: ["main"]
     tags: ["v*"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
@@ -23,15 +25,22 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt ruff
+          pip install -e ".[dev]" build
 
       - name: Lint
         run: ruff check src tests
 
-      - name: Unit tests
-        run: python -m unittest discover -v
+      - name: Offline unit and wire-contract tests
+        run: python -W error::ResourceWarning -m tests.run_offline
+
+      - name: Compile source
+        run: python -m compileall -q src tests
+
+      - name: Build distribution
+        run: python -m build
 
   docker:
+    if: github.event_name != 'pull_request'
     needs: test
     runs-on: ubuntu-latest
     steps:

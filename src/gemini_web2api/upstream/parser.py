@@ -2,6 +2,8 @@
 import json
 import re
 
+from .retry import UpstreamRejection
+
 
 def clean_text(text: str, strip: bool = True) -> str:
     text = re.sub(
@@ -39,7 +41,7 @@ def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
     bard_err = re.search(r'BardErrorInfo(?:\s*"?\s*,)?\s*\[\s*(\d+)\s*\]', raw)
     if bard_err:
-        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
+        raise UpstreamRejection(int(bard_err.group(1)))
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):

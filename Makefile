@@ -8,7 +8,7 @@ export PYTHONPATH := src
 
 ## test: run the unit test suite (no network, upstream fully mocked)
 test:
-	$(PYTHON) -m unittest discover -v
+	$(PYTHON) -m tests.run_offline
 
 ## lint: static checks with ruff
 lint:

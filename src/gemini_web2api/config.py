@@ -4,6 +4,7 @@ CONFIG is a plain dict (seeded from DEFAULT_CONFIG) that every module reads
 and that tests mutate directly; keep that contract intact.
 """
 import json
+import math
 import os
 import sys
 
@@ -13,6 +14,11 @@ DEFAULT_CONFIG = {
     "retry_attempts": 3,
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,
+    "request_deadline_sec": 180,
+    "queue_timeout_sec": 30,
+    "max_queued_requests": 64,
+    "translation_batch_max_chars": 12000,
+    "translation_batch_max_segments": 25,
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
@@ -43,11 +49,21 @@ DEFAULT_CONFIG = {
     # always written.
     "log_file": None,
     "log_retention_days": 7,
+    # Hard limits protect the threaded HTTP server from accidental or hostile
+    # memory exhaustion. Images have a separate cap because they are fetched
+    # and uploaded before generation.
+    "max_request_body_bytes": 16 * 1024 * 1024,
+    "max_image_bytes": 20 * 1024 * 1024,
+    "request_body_timeout_sec": 30,
+    "allow_private_image_urls": False,
 }
 
 # Known key types for validation: "int", "float", "str", "bool", "list".
 _TYPED_KEYS = {
     "port": "int", "retry_attempts": "int", "request_timeout_sec": "int",
+    "request_deadline_sec": "float", "queue_timeout_sec": "float",
+    "max_queued_requests": "int", "translation_batch_max_chars": "int",
+    "translation_batch_max_segments": "int",
     "retry_delay_sec": "int", "max_concurrent_requests": "int",
     "keep_warm_interval_sec": "int", "keepalive_sec": "int",
     "slow_retry_sec": "int",
@@ -56,6 +72,8 @@ _TYPED_KEYS = {
     "host": "str", "gemini_bl": "str", "default_model": "str",
     "impersonate": "str",
     "log_file": "str", "log_retention_days": "int",
+    "max_request_body_bytes": "int", "max_image_bytes": "int",
+    "request_body_timeout_sec": "int", "allow_private_image_urls": "bool",
     "log_requests": "bool", "temporary_chats": "bool",
     "auto_delete_history": "bool",
     "api_keys": "list", "cookie_files": "list",
@@ -100,6 +118,16 @@ def validate_config(cfg: dict = None) -> list:
         }[expected](value)
         if not ok:
             problems.append(f"{key}: expected {expected}, got {type(value).__name__}")
+    for key in ("request_deadline_sec", "queue_timeout_sec", "max_queued_requests",
+                "translation_batch_max_chars", "translation_batch_max_segments"):
+        value = cfg.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                valid = math.isfinite(value) and value > 0
+            except OverflowError:
+                valid = False
+            if not valid:
+                problems.append(f"{key}: must be positive and finite; safe default will be used")
     for key in cfg:
         if key not in DEFAULT_CONFIG:
             problems.append(f"unknown key (typo?): {key}")

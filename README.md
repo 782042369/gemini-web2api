@@ -21,6 +21,10 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
 
+## Reliability and security
+
+See [hardening and verification](docs/HARDENING.md) for request limits, account isolation, true text streaming, remote-image restrictions (including proxy compatibility), offline tests and remaining operational boundaries.
+
 ## Quick Start
 
 From a source checkout:

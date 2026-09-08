@@ -1,354 +1,353 @@
-"""Upstream generation pipeline: retries, coalescing, streaming, keep-warm.
-
-Owns the request loop around one upstream generation: in-flight coalescing,
-retry/backoff policy, the wall-clock slow-walk breaker, streaming delta
-extraction and the opt-in keep-warm background loop.
-"""
+"""Bounded upstream generation, retry classification and single-flight sharing."""
 import codecs
-import random
+import json
 import re
 import threading
 import time
 import uuid
 
 from ..config import CONFIG
+from ..budget import (RequestBudget, RequestControlError, RequestCancelled, RequestDeadlineExceeded,
+                      budget_scope, check_budget, current_budget,
+                      positive_seconds, remaining_timeout)
 from ..logs import log
 from .concurrency import _UpstreamSlot
-from .cookies import _active_cookie_path, pick_next_cookie
+from .cookies import _active_auth_user, _active_cookie_path, pick_next_cookie
 from .history import schedule_history_delete
-from .parser import (_extract_conversation_id, _extract_texts_from_line,
-                     clean_text, extract_conversation_id,
-                     extract_response_text)
+from .parser import (_extract_conversation_id, _extract_texts_from_line, clean_text,
+                     extract_conversation_id, extract_response_text)
+from .retry import EmptyUpstreamResponse, UpstreamRejection, retry_decision
+from .retry import _retry_delay as _retry_delay  # backward-compatible import path
 from .protocol import _build_headers, _build_payload, _get_url
 from .transport import (HAS_HTTPX, _get_httpx_client, _urllib_post,
-                        get_browser_session)
+                        curl_total_timeout, get_browser_session)
 
 try:
     import httpx
 except ImportError:
     httpx = None
 
-
-# In-flight coalescing: identical concurrent generate() calls share one upstream request.
 _inflight = {}
 _inflight_lock = threading.Lock()
 
 
-def _renew_cookies(resp) -> None:
-    """Forward a response's Set-Cookie renewal to the keepalive module.
+class _AttemptDeadlineExceeded(TimeoutError):
+    """One attempt's slow-walk limit expired; the overall budget is unchanged."""
 
-    Lazy import avoids an import cycle (keepalive imports this module).
 
-    Args:
-        resp: upstream response object.
-
-    Returns:
-        None.
-    """
+def _renew_cookies(resp):
+    """Renew active cookies. Args: response. Returns: None."""
     from ..keepalive import _merge_response_cookies
     _merge_response_cookies(resp)
 
 
 def _refresh_xsrf():
-    """Forward the throttled SNlM0e refresh to the keepalive module.
-
-    Args:
-        None.
-
-    Returns:
-        None.
-    """
+    """Refresh active XSRF under the same request budget. Args: None. Returns: None."""
     from ..keepalive import _maybe_refresh_xsrf
+    check_budget("session refresh")
     _maybe_refresh_xsrf()
+    check_budget("session refresh")
 
 
-def _retry_delay(attempt: int, transport_error: bool = False,
-                 rate_limited: bool = False) -> float:
-    """Exponential backoff with jitter, capped at 15s (60s when rate-limited).
+def _is_transport_error(error):
+    """Check classifier compatibility. Args: exception. Returns: transport category flag."""
+    return retry_decision(error, 0).category == "transport"
 
-    Connection-level failures (stale pooled connection, TLS reset, DNS blip)
-    are retried immediately: the upstream hasn't rejected the request, so
-    sleeping 2s+ would only add latency to what is a fresh-reconnect case.
 
-    Upstream 429/503 means account- or IP-level throttling: hammering it
-    again within 0.1s only deepens the penalty, so those retry on a long
-    ladder (10s, 25s) to let the limit cool down.
+def _inflight_key(prompt, model_id, think_mode, file_refs, extra_fields):
+    """Build an account/options-safe sharing key. Args: generation arguments. Returns: tuple."""
+    return (prompt, model_id, think_mode, _active_cookie_path(), _active_auth_user(),
+            tuple((str(ref), getattr(ref, "mime_type", None)) for ref in (file_refs or [])),
+            json.dumps(extra_fields, sort_keys=True, separators=(",", ":")) if extra_fields else None)
+
+
+def generate(prompt, model_id, think_mode, file_refs=None, extra_fields=None):
+    """Generate once for identical concurrent calls without coupling waiter deadlines.
 
     Args:
-        attempt: zero-based retry index.
-        transport_error: True for connection-level errors (immediate retry).
-        rate_limited: True when the error carried HTTP 429/503.
+        prompt: Flattened prompt.
+        model_id: Gemini mode.
+        think_mode: Thinking level.
+        file_refs: Uploaded references for this account.
+        extra_fields: Additional protocol slots.
 
     Returns:
-        Seconds to sleep before the next attempt.
+        Non-empty text, or raises; a timed-out follower never returns None as success.
     """
-    if rate_limited:
-        return min(10 + 15 * attempt, 60)
-    if transport_error:
-        return 0.05
-    base = CONFIG.get("retry_delay_sec", 2)
-    return min(base * (2 ** attempt) + random.uniform(0, 0.5), 15)
-
-
-def _is_transport_error(e: BaseException) -> bool:
-    """True for connection-level errors worth an immediate retry."""
-    if isinstance(e, _AttemptDeadlineExceeded):
-        return True  # slow-walk breaker: retry at once, backoff would waste time
-    if HAS_HTTPX and isinstance(e, httpx.TransportError):
-        return True
-    return isinstance(e, (ConnectionError, OSError)) and not isinstance(e, RuntimeError)
-
-
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    """Non-streaming generation with retry.
-
-    Concurrent identical requests (same prompt/model/cookie) are coalesced
-    into a single upstream call - common when several browser tabs translate
-    the same text at once.
-    """
-    key = (
-        prompt, model_id, think_mode, _active_cookie_path(),
-        tuple(file_refs or []),
-        tuple(sorted(extra_fields.items())) if extra_fields else None,
-    )
-    with _inflight_lock:
-        entry = _inflight.get(key)
-        is_owner = entry is None
-        if is_owner:
-            entry = {"event": threading.Event(), "result": None, "error": None}
-            _inflight[key] = entry
-    if not is_owner:
-        entry["event"].wait(timeout=CONFIG["request_timeout_sec"] * 2 + 10)
-        if entry["error"] is not None:
-            raise entry["error"]
-        return entry["result"]
-    try:
-        result = _generate_upstream(prompt, model_id, think_mode, file_refs, extra_fields)
-        entry["result"] = result
-        return result
-    except Exception as e:
-        entry["error"] = e
-        raise
-    finally:
-        with _inflight_lock:
-            _inflight.pop(key, None)
-        entry["event"].set()
-
-
-def _per_attempt_timeout():
-    """Per-read timeout for one upstream attempt (slow-walk detection aid).
-
-    Note: httpx "read" timeout only fires BETWEEN chunks. Google slow-walks
-    often trickle bytes, keeping every inter-chunk gap short — so this alone
-    never bounds total time (observed 516s with read=60s). The real bound is
-    the wall-clock deadline enforced while iterating the streamed response.
-    """
-    deadline = CONFIG.get("slow_retry_sec") or 0
-    total = CONFIG["request_timeout_sec"]
-    try:
-        deadline = float(deadline)
-    except (TypeError, ValueError):
-        return None
-    if deadline <= 0 or deadline >= total:
-        return None
-    if HAS_HTTPX:
-        return httpx.Timeout(total, read=deadline)
-    return deadline
+    with budget_scope() as budget:
+        key = _inflight_key(prompt, model_id, think_mode, file_refs, extra_fields)
+        while True:
+            budget.check("coalesced generation")
+            with _inflight_lock:
+                entry = _inflight.get(key)
+                owner = entry is None
+                if owner:
+                    entry = {"event": threading.Event(), "result": None, "error": None}
+                    _inflight[key] = entry
+            if owner:
+                break
+            budget.wait(entry["event"], "coalesced generation")
+            if isinstance(entry["error"], (RequestCancelled, RequestDeadlineExceeded)):
+                # Another request's shorter deadline/cancellation is not ours.
+                # Rejoin ownership only within this waiter's original budget.
+                budget.check("coalesced owner ended")
+                continue
+            if entry["error"] is not None:
+                raise entry["error"]
+            if not isinstance(entry["result"], str) or not entry["result"].strip():
+                raise EmptyUpstreamResponse("coalesced generation returned empty output")
+            return entry["result"]
+        try:
+            result = _generate_upstream(prompt, model_id, think_mode, file_refs, extra_fields)
+            budget.check("generation completion")
+            entry["result"] = result
+            return result
+        except BaseException as exc:
+            entry["error"] = exc if isinstance(exc, Exception) else RuntimeError("shared generation interrupted")
+            raise
+        finally:
+            with _inflight_lock:
+                entry["event"].set()
+                _inflight.pop(key, None)
 
 
 def _attempt_deadline():
-    """Absolute wall-clock deadline for one upstream attempt, or None."""
-    deadline = CONFIG.get("slow_retry_sec") or 0
-    total = CONFIG["request_timeout_sec"]
+    """Cap one attempt by its slow-walk and overall limits. Args: None. Returns: seconds."""
+    cap = positive_seconds("request_timeout_sec", 180)
     try:
-        deadline = float(deadline)
+        slow = float(CONFIG.get("slow_retry_sec") or 0)
+        if slow > 0:
+            cap = min(cap, slow)
     except (TypeError, ValueError):
-        return None
-    if deadline <= 0 or deadline >= total:
-        return None
-    return deadline
+        pass
+    return remaining_timeout(cap, "upstream generation")
 
 
-class _AttemptDeadlineExceeded(Exception):
-    """Wall-clock slow-walk breaker tripped for one upstream attempt."""
+def _per_attempt_timeout():
+    """Return finite httpx phase timeouts. Args: None. Returns: httpx timeout or seconds."""
+    seconds = _attempt_deadline()
+    return httpx.Timeout(seconds, connect=min(10, seconds)) if HAS_HTTPX else seconds
 
 
-def _stream_upstream_chunks(sess, client, url: str, body: bytes, headers: dict):
-    """Open one streaming upstream POST and yield decoded text chunks.
-
-    All transport-specific plumbing ends here. The curl_cffi path is
-    preferred (real Chrome TLS/h2 fingerprint); its bytes chunks are fed
-    through an incremental UTF-8 decoder so multi-byte characters split
-    across chunks survive, which a naive per-chunk decode would corrupt.
-    The pooled httpx path surfaces iter_text() chunks directly. Both raise
-    for HTTP status errors and renew cookies from Set-Cookie.
-
-    Streaming the response even for non-streaming generate() is
-    intentional: iterating chunks lets callers enforce a WALL-CLOCK
-    deadline, which a plain read timeout cannot do when Google slow-walks
-    with a trickle of bytes.
+def _stream_upstream_chunks(sess, client, url, body, headers):
+    """Read one response under native/phase timeouts and a monotonic attempt bound.
 
     Args:
-        sess: curl_cffi session (preferred), or None to use httpx.
-        client: pooled httpx client; required when sess is None.
-        url: StreamGenerate endpoint URL.
-        body: urlencoded request body (bytes).
-        headers: prepared request headers.
+        sess: Preferred curl_cffi session or None.
+        client: httpx fallback or None.
+        url: Gemini endpoint.
+        body: Encoded request bytes.
+        headers: Prepared account headers.
 
     Yields:
-        Decoded, non-empty text chunks (str).
-
-    Raises:
-        Whatever the transport raises; propagated to the caller unchanged.
+        Decoded text. curl uses TIMEOUT_MS even for streaming headers/trickle
+        reads; fallback phase timeouts are reinforced by between-chunk checks.
     """
+    seconds = _attempt_deadline()
+    until = time.monotonic() + seconds
+
+    def check():
+        """Check both bounds. Args: None. Returns: None or raises."""
+        check_budget("upstream response")
+        if time.monotonic() >= until:
+            raise _AttemptDeadlineExceeded(f"slow-walk breaker: attempt exceeded {seconds:.0f}s")
+
     if sess is not None:
-        r = sess.post(url, data=body, headers=headers, stream=True,
-                      timeout=(10, CONFIG["request_timeout_sec"]))
+        with curl_total_timeout(sess, seconds):
+            response = sess.post(url, data=body, headers=headers, stream=True,
+                                 timeout=(min(10, seconds), seconds))
         try:
-            r.raise_for_status()
-            _renew_cookies(r)
+            check()
+            response.raise_for_status()
+            _renew_cookies(response)
             decoder = codecs.getincrementaldecoder("utf-8")("replace")
-            for chunk in r.iter_content():
+            for chunk in response.iter_content():
+                check()
                 if chunk:
-                    text = decoder.decode(chunk)
-                    if text:
-                        yield text
+                    decoded = decoder.decode(chunk)
+                    if decoded:
+                        yield decoded
+            check()
             tail = decoder.decode(b"", True)
             if tail:
                 yield tail
         finally:
-            r.close()
-    else:
-        with client.stream("POST", url, content=body, headers=headers,
-                           timeout=_per_attempt_timeout()) as resp:
-            resp.raise_for_status()
-            _renew_cookies(resp)
-            for chunk in resp.iter_text():
+            response.close()
+    elif client is not None:
+        with client.stream("POST", url, content=body, headers=headers, timeout=_per_attempt_timeout()) as response:
+            check()
+            response.raise_for_status()
+            _renew_cookies(response)
+            for chunk in response.iter_text():
+                check()
                 if chunk:
                     yield chunk
+            check()
+    else:
+        raw = _urllib_post(url, body, headers, timeout=seconds)
+        check()
+        yield raw
 
 
-def _generate_upstream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    """Single-owner upstream call with retries. Uses the pooled httpx client."""
-    _refresh_xsrf()
-    uuid_val = str(uuid.uuid4()).upper()
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields, uuid_val).encode()
-    url = _get_url()
-    headers = _build_headers(uuid_val)
-    sess = get_browser_session()
-    client = _get_httpx_client() if HAS_HTTPX else None
-    attempt_timeout = _per_attempt_timeout()
+def _attempts():
+    """Read a bounded retry count. Args: None. Returns: positive number of attempts."""
+    value = CONFIG.get("retry_attempts", 3)
+    return max(1, min(value, 10)) if isinstance(value, int) and not isinstance(value, bool) else 3
 
-    last_err = None
-    for attempt in range(CONFIG["retry_attempts"]):
+
+def _retry(error, attempt, attempts, emitted=False):
+    """Apply classified backoff only if useful and affordable.
+
+    Args:
+        error: Failed attempt exception.
+        attempt: Zero-based attempt number.
+        attempts: Maximum total attempts.
+        emitted: Whether any output was already sent downstream.
+
+    Returns:
+        True for another attempt, False for terminal failures. Budget expiry
+        raises instead of extending the deadline to accommodate Retry-After.
+    """
+    if isinstance(error, RequestControlError):
+        raise error
+    check_budget("retry decision")
+    decision = retry_decision(error, attempt, emitted=emitted)
+    if not decision.retryable or attempt + 1 >= attempts:
+        log(f"Upstream retry stopped: category={decision.category} attempt={attempt + 1} emitted={emitted}")
+        return False
+    log(f"Retry {attempt + 1}/{attempts} in {decision.delay:.2f}s: category={decision.category}")
+    current_budget().sleep(decision.delay)
+    return True
+
+
+def _generate_upstream(prompt, model_id, think_mode, file_refs=None, extra_fields=None):
+    """Generate under a single queue/upload/retry budget. Args: generation fields. Returns: non-empty text."""
+    with budget_scope():
+        request_uuid = str(uuid.uuid4()).upper()
+        attempts = _attempts()
+        for attempt in range(attempts):
+            try:
+                with _UpstreamSlot():
+                    _refresh_xsrf()
+                    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields, request_uuid).encode()
+                    url, headers = _get_url(), _build_headers(request_uuid)
+                    sess = get_browser_session()
+                    client = _get_httpx_client() if sess is None and HAS_HTTPX else None
+                    started = time.monotonic()
+                    raw = "".join(_stream_upstream_chunks(sess, client, url, body, headers))
+                text = extract_response_text(raw)
+                if not text.strip():
+                    raise EmptyUpstreamResponse("upstream returned empty output")
+                check_budget("generation completion")
+                log(f"Upstream generate: {time.monotonic() - started:.2f}s chars={len(text)} attempt={attempt + 1}")
+                if CONFIG.get("auto_delete_history"):
+                    schedule_history_delete(extract_conversation_id(raw))
+                return text
+            except Exception as exc:
+                if not _retry(exc, attempt, attempts):
+                    raise
+
+
+def generate_stream(prompt, model_id, think_mode, file_refs=None, extra_fields=None):
+    """Stream using one budget without leaking thread context across yields.
+
+    Args:
+        prompt: Flattened prompt.
+        model_id: Gemini mode.
+        think_mode: Thinking level.
+        file_refs: Uploaded references.
+        extra_fields: Protocol overrides.
+
+    Yields:
+        Text deltas. Interleaved library streams retain independent deadlines;
+        HTTP calls retain their explicit request budget. Close always releases
+        the response and capacity, even when the budget has expired.
+    """
+    budget = current_budget() or RequestBudget()
+    stream = _generate_stream_owned(prompt, model_id, think_mode, file_refs, extra_fields)
+    try:
+        while True:
+            try:
+                with budget_scope(budget):
+                    delta = next(stream)
+            except StopIteration:
+                return
+            yield delta
+    finally:
+        with budget_scope(budget, check=False):
+            stream.close()
+
+
+def _generate_stream_owned(prompt, model_id, think_mode, file_refs, extra_fields):
+    """Run a stream under the wrapper's active budget. Args: generation fields. Yields: deltas."""
+    request_uuid = str(uuid.uuid4()).upper()
+    attempts = _attempts()
+    for attempt in range(attempts):
+        emitted = False
+        raw_text = ""
+        conversation_id = None
+        first_delta = None
         try:
             with _UpstreamSlot():
-                t0 = time.time()
-                deadline_sec = _attempt_deadline()
-                if sess is not None or client is not None:
-                    parts = []
-                    for chunk in _stream_upstream_chunks(sess, client, url, body, headers):
-                        parts.append(chunk)
-                        if deadline_sec and time.time() - t0 > deadline_sec:
-                            raise _AttemptDeadlineExceeded(
-                                f"slow-walk breaker: attempt exceeded {deadline_sec:.0f}s"
-                            )
-                    raw = "".join(parts)
-                else:
-                    raw = _urllib_post(url, body, headers, timeout=attempt_timeout)
-                    if deadline_sec and time.time() - t0 > deadline_sec:
-                        raise _AttemptDeadlineExceeded(
-                            f"slow-walk breaker: attempt exceeded {deadline_sec:.0f}s"
-                        )
-            text = extract_response_text(raw)
-            log(f"Upstream generate: {time.time() - t0:.2f}s chars={len(text)} attempt={attempt + 1}")
-            if CONFIG.get("auto_delete_history"):
-                schedule_history_delete(extract_conversation_id(raw))
-            return text
-        except Exception as e:
-            last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                rate_limited = any(s in str(e) for s in ("503", "429"))
-                delay = _retry_delay(attempt, transport_error=_is_transport_error(e),
-                                     rate_limited=rate_limited)
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']} in {delay:.1f}s: {e}")
-                time.sleep(delay)
-    raise last_err
-
-
-def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
-    """Streaming generation with retry on connection failure."""
-    sess = get_browser_session()
-    if sess is None and not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
-        if text:
-            yield text
-        return
-
-    uuid_val = str(uuid.uuid4()).upper()
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields, uuid_val)
-    url = _get_url()
-    headers = _build_headers(uuid_val)
-    client = _get_httpx_client() if HAS_HTTPX else None
-
-    last_err = None
-    emitted_raw_text = ""
-    stream_cid = None
-    for attempt in range(CONFIG["retry_attempts"]):
-        stream_cid = None
-        try:
-            slot = _UpstreamSlot().__enter__()
-            t0 = time.time()
-            deadline_sec = _attempt_deadline()
-            try:
+                _refresh_xsrf()
+                body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields, request_uuid).encode()
+                url, headers = _get_url(), _build_headers(request_uuid)
+                sess = get_browser_session()
+                client = _get_httpx_client() if sess is None and HAS_HTTPX else None
+                started = time.monotonic()
                 buf = ""
-                first_delta_t = None
-                for chunk in _stream_upstream_chunks(sess, client, url, body, headers):
-                    buf += chunk
-                    if deadline_sec and time.time() - t0 > deadline_sec:
-                        raise _AttemptDeadlineExceeded(
-                            f"slow-walk breaker: stream exceeded {deadline_sec:.0f}s"
-                        )
-                    if "BardErrorInfo" in buf:
-                        bard_err = re.search(r'BardErrorInfo(?:\s*"?\s*,)?\s*\[\s*(\d+)\s*\]', buf)
-                        if bard_err:
-                            raise RuntimeError(
-                                f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
-                            )
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        stream_cid = _extract_conversation_id(line) or stream_cid
-                        for t in _extract_texts_from_line(line):
-                            if t == emitted_raw_text or emitted_raw_text.startswith(t):
-                                continue
-                            if not t.startswith(emitted_raw_text):
-                                raise RuntimeError("Gemini stream content changed during retry")
-                            delta = clean_text(t[len(emitted_raw_text):], strip=False)
-                            emitted_raw_text = t
-                            if delta:
-                                if first_delta_t is None:
-                                    first_delta_t = time.time()
+
+                def deltas(line):
+                    """Parse a snapshot. Args: one protocol line. Yields: new text only."""
+                    nonlocal raw_text, conversation_id
+                    conversation_id = _extract_conversation_id(line) or conversation_id
+                    texts = _extract_texts_from_line(line)
+                    if not texts:
+                        return
+                    value = max(texts, key=len)
+                    if value == raw_text or raw_text.startswith(value):
+                        return
+                    if not value.startswith(raw_text):
+                        raise RuntimeError("Gemini stream content changed")
+                    delta = clean_text(value[len(raw_text):], strip=False)
+                    raw_text = value
+                    if delta:
+                        yield delta
+
+                chunks = _stream_upstream_chunks(sess, client, url, body, headers)
+                try:
+                    for chunk in chunks:
+                        check_budget("stream generation")
+                        buf += chunk
+                        rejected = re.search(r'BardErrorInfo(?:\s*"?\s*,)?\s*\[\s*(\d+)\s*\]', buf)
+                        if rejected:
+                            raise UpstreamRejection(int(rejected.group(1)))
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            for delta in deltas(line):
+                                if first_delta is None:
+                                    first_delta = time.monotonic()
+                                emitted = True
                                 yield delta
-            finally:
-                slot.__exit__(None, None, None)
+                                check_budget("stream delivery")
+                    for delta in deltas(buf):
+                        if first_delta is None:
+                            first_delta = time.monotonic()
+                        emitted = True
+                        yield delta
+                        check_budget("stream delivery")
+                finally:
+                    chunks.close()
+            if not emitted:
+                raise EmptyUpstreamResponse("upstream stream returned empty output")
             if CONFIG.get("auto_delete_history"):
-                schedule_history_delete(stream_cid)
-            # Latency breakdown: ttfb (request sent -> first emitted delta)
-            # vs total (request sent -> stream end) separates "Google is
-            # slow to start" from "generation itself is long" in production
-            # logs. Format is a stable grep key; keep it byte-stable.
-            ttfb = f"{first_delta_t - t0:.2f}s" if first_delta_t is not None else "n/a"
-            log(f"Upstream stream: ttfb={ttfb} total={time.time() - t0:.2f}s chars={len(emitted_raw_text)} attempt={attempt + 1}")
+                schedule_history_delete(conversation_id)
+            ttfb = f"{first_delta - started:.2f}s" if first_delta is not None else "n/a"
+            log(f"Upstream stream: ttfb={ttfb} total={time.monotonic() - started:.2f}s chars={len(raw_text)} attempt={attempt + 1}")
             return
-        except Exception as e:
-            last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                rate_limited = any(s in str(e) for s in ("503", "429"))
-                delay = _retry_delay(attempt, transport_error=_is_transport_error(e),
-                                     rate_limited=rate_limited)
-                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']} in {delay:.1f}s: {e}")
-                time.sleep(delay)
-    raise last_err
+        except Exception as exc:
+            if not _retry(exc, attempt, attempts, emitted=emitted):
+                raise
 
 
 def _keep_warm_loop(interval: float):

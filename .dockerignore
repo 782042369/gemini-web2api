@@ -27,5 +27,8 @@ docker-compose*.yml.bak-*
 .env.*
 *.log
 logs/
+build/
+dist/
+*.egg-info/
 *.bak
 *.bak-*

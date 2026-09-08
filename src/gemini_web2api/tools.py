@@ -47,7 +47,7 @@ def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
     if tool_choice == "required":
         return "\n\nIMPORTANT: You MUST call at least one tool. Do not respond with text only."
     if isinstance(tool_choice, dict):
-        fn_name = tool_choice.get("function", {}).get("name", "")
+        fn_name = tool_choice.get("function", tool_choice).get("name", "")
         if fn_name:
             return f'\n\nIMPORTANT: You MUST call the tool "{fn_name}". Do not call other tools.'
     return ""
@@ -136,7 +136,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
         if isinstance(content, list):
             text_parts = []
             for c in content:
-                if c.get("type") in ("text", "input_text"):
+                if c.get("type") in ("text", "input_text", "output_text"):
                     text_parts.append(c.get("text", ""))
                 else:
                     image = _image_from_part(c)
@@ -145,7 +145,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                         text_parts.append("[Image attached]")
             content = " ".join(text_parts)
 
-        if role == "system":
+        if role in ("system", "developer"):
             parts.append(f"[System instruction]: {content}")
         elif role == "assistant":
             if msg.get("tool_calls"):
@@ -168,30 +168,63 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     return prompt, images
 
 
-def parse_tool_calls(text: str) -> tuple:
-    """Extract tool_call blocks. Returns (clean_text, tool_calls_list)."""
-    tool_calls = []
-    pattern = r'```tool_call\s*\n(.*?)\n```'
-    clean_parts = []
-    last_end = 0
-    for m in re.finditer(pattern, text, re.DOTALL):
-        clean_parts.append(text[last_end:m.start()])
-        last_end = m.end()
+
+def _validated_function(data, allowed_names):
+    """Validate untrusted model function output without executing it.
+
+    Args:
+        data: Decoded JSON value from the model.
+        allowed_names: None accepts any name; an empty set accepts none.
+
+    Returns:
+        A name/args object, or None for malformed or undeclared calls.
+    """
+    if not isinstance(data, dict):
+        return None
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if allowed_names is not None and name not in allowed_names:
+        return None
+    args = data.get("arguments", data.get("args", {}))
+    if isinstance(args, str):
+        args = json.loads(args)
+    if not isinstance(args, dict):
+        return None
+    # Strict JSON: Python's decoder tolerates NaN/Infinity, tool arguments do not.
+    json.dumps(args, allow_nan=False)
+    return {"name": name, "args": args}
+
+
+def parse_tool_calls(text: str, allowed_names=None) -> tuple:
+    """Extract valid declared calls while preserving malformed blocks as text.
+
+    Args:
+        text: Model output containing fenced tool_call blocks.
+        allowed_names: Declared names; None is unrestricted, empty forbids all.
+
+    Returns:
+        Clean text and OpenAI calls with valid JSON-object argument strings.
+    """
+    calls = []
+    allowed = set(allowed_names) if allowed_names is not None else None
+
+    def extract(match):
+        """Parse one match. Args: regex match. Returns: retained text or empty string."""
         try:
-            data = json.loads(m.group(1).strip())
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {
-                    "name": data["name"],
-                    "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
-                },
-            })
-        except (json.JSONDecodeError, KeyError):
-            pass
-    clean_parts.append(text[last_end:])
-    clean = "".join(clean_parts).strip()
-    return clean, tool_calls
+            call = _validated_function(json.loads(match.group(1)), allowed)
+            if call is None:
+                return match.group(0)
+            calls.append({"id": f"call_{uuid.uuid4().hex[:8]}", "type": "function",
+                          "function": {"name": call["name"],
+                                       "arguments": json.dumps(call["args"], ensure_ascii=False, allow_nan=False)}})
+            return ""
+        except (TypeError, ValueError, RecursionError):
+            return match.group(0)
+
+    clean = text
+    clean = re.sub(r'```tool_call\s*\n(.*?)\n```', extract, clean, flags=re.DOTALL)
+    return clean.strip(), calls
 
 
 # ─── Google Native API helpers ─────────────────────────────────────────────────
@@ -218,8 +251,8 @@ def build_tool_prompt(tool_defs: list) -> str:
 
 def _google_tool_choice_instruction(req: dict) -> str:
     """Extract tool_choice constraint from Google API toolConfig."""
-    tool_config = req.get("toolConfig", {})
-    fc_config = tool_config.get("functionCallingConfig", {})
+    tool_config = req.get("toolConfig") or {}
+    fc_config = tool_config.get("functionCallingConfig") or {}
     mode = fc_config.get("mode", "AUTO")
     allowed = fc_config.get("allowedFunctionNames", [])
 
@@ -241,8 +274,8 @@ def google_contents_to_prompt(req: dict) -> tuple:
     parts = []
     images = []
 
-    tool_config = req.get("toolConfig", {})
-    fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
+    tool_config = req.get("toolConfig") or {}
+    fc_mode = (tool_config.get("functionCallingConfig") or {}).get("mode", "AUTO")
 
     tools = req.get("tools")
     tool_defs = []
@@ -304,41 +337,54 @@ def google_contents_to_prompt(req: dict) -> tuple:
     return "\n\n".join(p for p in parts if p), images
 
 
-def parse_google_function_calls(text: str) -> tuple:
-    """Extract function_call blocks from model output.
+def parse_google_function_calls(text: str, allowed_names=None) -> tuple:
+    """Extract declared Google calls, preserving malformed output as plain text.
 
-    Handles 3 formats:
-    1. ```function_call\\n{...}\\n``` (standard)
-    2. function_call\\n{...} (without backticks)
-    3. Raw JSON with "name" + "args" keys
+    Args:
+        text: Model output with fenced, bare marker, or raw JSON calls.
+        allowed_names: None allows any name; an empty iterable forbids all.
 
-    Returns (clean_text, [{"name": ..., "args": ...}])
+    Returns:
+        Clean text and a list of name/args objects. Invalid blocks are retained.
     """
-    function_calls = []
-    pattern1 = r'```function_call\s*\n(.*?)\n```'
-    pattern2 = r'(?:^|\n)function_call\s*\n(\{[^`]*?\})'
-    clean = text
-    for pattern in [pattern1, pattern2]:
-        for match in re.findall(pattern, clean, re.DOTALL):
-            try:
-                data = json.loads(match.strip())
-                if "name" in data:
-                    function_calls.append({
-                        "name": data["name"],
-                        "args": data.get("args", data.get("arguments", {})),
-                    })
-            except (json.JSONDecodeError, KeyError):
-                pass
-        clean = re.sub(pattern, '', clean, flags=re.DOTALL).strip()
-    if not function_calls and clean.strip().startswith("{"):
+    calls = []
+    allowed = set(allowed_names) if allowed_names is not None else None
+
+    def extract(match):
+        """Parse a fence. Args: regex match. Returns: retained text or empty string."""
         try:
-            data = json.loads(clean.strip())
-            if "name" in data and ("args" in data or "arguments" in data):
-                function_calls.append({
-                    "name": data["name"],
-                    "args": data.get("args", data.get("arguments", {})),
-                })
-                clean = ""
-        except (json.JSONDecodeError, KeyError):
+            call = _validated_function(json.loads(match.group(1)), allowed)
+            if call is not None:
+                calls.append(call)
+                return ""
+        except (TypeError, ValueError, RecursionError):
             pass
-    return clean, function_calls
+        return match.group(0)
+
+    fence = chr(96) * 3
+    clean = re.sub(fence + r"function_call\s*\n(.*?)\n" + fence, extract, text, flags=re.DOTALL)
+    decoder = json.JSONDecoder()
+    ranges = []
+    for match in re.finditer(r"(?:^|\n)function_call\s*\n", clean):
+        tail = clean[match.end():]
+        stripped = tail.lstrip()
+        try:
+            data, length = decoder.raw_decode(stripped)
+            call = _validated_function(data, allowed)
+            if call is not None:
+                calls.append(call)
+                ranges.append((match.start(), match.end() + len(tail) - len(stripped) + length))
+        except (TypeError, ValueError, RecursionError):
+            pass
+    for start, end in reversed(ranges):
+        clean = clean[:start] + clean[end:]
+    if not calls and clean.strip().startswith("{"):
+        try:
+            data = json.loads(clean)
+            call = _validated_function(data, allowed)
+            if call is not None and ("args" in data or "arguments" in data):
+                calls.append(call)
+                clean = ""
+        except (TypeError, ValueError, RecursionError):
+            pass
+    return clean.strip(), calls

@@ -4,13 +4,17 @@ Micro-batching collects burst single-segment generateContent requests into
 one numbered upstream call; batch translation splits one multi-part request
 into numbered segments. Both fall back to direct calls per dropped segment.
 """
-import re
 import threading
 import time
 
 from .config import CONFIG
+from .budget import (RequestBudget, RequestControlError, QueueTimeout, QueueFull, budget_scope,
+                     check_budget, positive_seconds)
 from .logs import get_request_id, log
 from .upstream import generate
+from .upstream.cookies import _active_auth_user, _active_cookie_path, set_active_auth_user, use_cookie
+from .translation import parse_numbered_translations, require_translation, split_translation_batches
+from .upstream.concurrency import max_queued_requests
 
 
 class _MicroBatcher:
@@ -70,19 +74,40 @@ class _MicroBatcher:
         Returns:
             Result text for this segment. Raises the batch error on failure.
         """
+        with budget_scope() as budget:
+            return self._submit(item, budget)
+
+    def _submit(self, item, budget):
+        """Enqueue one caller under its original deadline. Args: item, budget. Returns: text."""
         self._ensure_worker()
         ev = threading.Event()
-        holder = {"event": ev, "result": None, "error": None}
+        holder = {"event": ev, "started": threading.Event(), "result": None, "error": None}
         entry = dict(item)
         entry["holder"] = holder
+        entry["budget"] = budget
         # Correlate this segment with its originating HTTP request: the
         # dispatcher thread has no thread-local id, so the id must travel
         # with the entry into the batch log line.
         entry["rid"] = get_request_id()
+        entry["cookie_path"] = _active_cookie_path()
+        entry["auth_user"] = _active_auth_user()
         with self._cv:
+            if len(self._pending) >= max_queued_requests():
+                raise QueueFull("translation batch queue is full")
             self._pending.append(entry)
             self._cv.notify_all()
-        ev.wait(timeout=CONFIG["request_timeout_sec"] + self.window + 15)
+        try:
+            if not budget.wait(holder["started"], "translation batch queue",
+                               limit=positive_seconds("queue_timeout_sec", 30)):
+                raise QueueTimeout("translation batch queue wait timed out")
+            budget.wait(ev, "translation batch result")
+        except RequestControlError:
+            with self._cv:
+                holder["cancelled"] = True
+                budget.cancel()
+                if entry in self._pending:
+                    self._pending.remove(entry)
+            raise
         if holder["error"] is not None:
             raise holder["error"]
         if holder["result"] is None:
@@ -102,18 +127,19 @@ class _MicroBatcher:
             with self._cv:
                 while not self._pending:
                     self._cv.wait()
-                batch_start = time.time()
+                batch_start = time.monotonic()
                 deadline = batch_start + self.window
                 while self._pending and len(self._pending) < self.max_segments:
-                    now = time.time()
+                    now = time.monotonic()
                     if now >= deadline:
                         break
                     # Loner fast-path: a lone segment with no company after
                     # single_wait dispatches immediately via the direct path,
                     # so low-traffic requests skip the full window cost.
-                    if len(self._pending) == 1 and now - batch_start >= self.single_wait:
+                    if len(self._pending) == 1 and now >= batch_start + self.single_wait:
                         break
-                    self._cv.wait(max(0.01, deadline - now))
+                    wake_at = min(deadline, batch_start + self.single_wait) if len(self._pending) == 1 else deadline
+                    self._cv.wait(max(0.001, wake_at - now))
                 batch, self._pending = self._pending, []
             self._run_batch(batch)
 
@@ -128,27 +154,76 @@ class _MicroBatcher:
         """
         buckets = {}
         for entry in batch:
-            buckets.setdefault(entry["key"], []).append(entry)
+            if not _entry_active(entry):
+                continue
+            key = (entry["key"], entry.get("cookie_path"), entry.get("auth_user"))
+            buckets.setdefault(key, []).append(entry)
+        groups = []
+        max_chars = CONFIG.get("translation_batch_max_chars", 12000)
+        if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
+            max_chars = 12000
         for entries in buckets.values():
-            prompts = [e["prompt"] for e in entries]
-            rids = [e["rid"] for e in entries if e.get("rid")]
-            # Dispatch log moved here from the runner closure so the batch
-            # members' request ids can be listed (the dispatcher thread has
-            # no thread-local id of its own). Key text unchanged.
+            overhead = getattr(entries[0]["runner"], "overhead_chars", 0)
+            overhead = overhead if isinstance(overhead, int) and overhead >= 0 else 0
+            chunks = split_translation_batches([e["prompt"] for e in entries], max(1, self.max_segments),
+                                               max_chars, overhead)
+            start = 0
+            for chunk in chunks:
+                groups.append(entries[start:start + len(chunk)])
+                start += len(chunk)
+        for group in groups:
+            # Earlier groups may have consumed the remaining queue budgets.
+            entries = [entry for entry in group if _entry_active(entry)]
+            if not entries:
+                continue
+            prompts = [entry["prompt"] for entry in entries]
+            rids = [entry["rid"] for entry in entries if entry.get("rid")]
             suffix = f" reqs={','.join(rids)}" if rids else ""
             log(f"Microbatch dispatch: {len(prompts)} segment(s){suffix}")
+            budgets = [entry["budget"] for entry in entries if entry.get("budget") is not None]
+            shared = RequestBudget(deadline=max(b.deadline for b in budgets),
+                                   cancel_check=lambda: all(not b.is_active() for b in budgets)) if budgets else RequestBudget()
+            for entry in entries:
+                if entry["holder"].get("started") is not None:
+                    entry["holder"]["started"].set()
             try:
-                results = entries[0]["runner"](prompts)
-                if len(results) != len(prompts):
+                with budget_scope(shared), use_cookie(entries[0].get("cookie_path")):
+                    set_active_auth_user(entries[0].get("auth_user"))
+                    results = entries[0]["runner"](prompts)
+                    shared.check("translation batch completion")
+                if not isinstance(results, list) or len(results) != len(prompts):
                     raise RuntimeError("microbatch: runner length mismatch")
-            except Exception as e:
+                results = [require_translation(result) for result in results]
+            except Exception as exc:
                 for entry in entries:
-                    entry["holder"]["error"] = e
-                    entry["holder"]["event"].set()
+                    _finish_entry(entry, error=exc)
                 continue
-            for entry, res in zip(entries, results):
-                entry["holder"]["result"] = res
-                entry["holder"]["event"].set()
+            for entry, result in zip(entries, results):
+                if _entry_active(entry):
+                    _finish_entry(entry, result=result)
+
+
+def _finish_entry(entry, result=None, error=None):
+    """Wake a waiter, including pre-dispatch failures. Args: entry, result, error. Returns: None."""
+    holder = entry["holder"]
+    holder["result"], holder["error"] = result, error
+    if holder.get("started") is not None:
+        holder["started"].set()
+    holder["event"].set()
+
+
+def _entry_active(entry):
+    """Discard cancelled/expired work before starting it. Args: entry. Returns: bool."""
+    if entry["holder"].get("cancelled"):
+        return False
+    budget = entry.get("budget")
+    if budget is not None:
+        try:
+            budget.check("translation batch queue")
+        except RequestControlError as exc:
+            _finish_entry(entry, error=exc)
+            return False
+    return True
 
 
 _MICROBATCHER = _MicroBatcher(
@@ -228,11 +303,13 @@ def _microbatch_runner(model_id, think_mode, extra_fields, instruction=""):
     prefix = f"{instruction}\n" if instruction else ""
 
     def _direct(prompt):
-        """Run one segment through the standard upstream path."""
-        return generate(f"{prefix}{prompt}", model_id, think_mode, None, extra_fields)
+        """Run a segment within the shared budget. Args: prompt. Returns: non-empty text."""
+        check_budget("translation fallback")
+        return require_translation(generate(f"{prefix}{prompt}", model_id, think_mode, None, extra_fields))
 
-    def _run(prompts):
-        """Execute prompts - one upstream call when batched, else direct."""
+    def _execute(prompts):
+        """Execute a group under its caller budget. Args: prompts. Returns: aligned texts."""
+        check_budget("translation generation")
         if len(prompts) == 1:
             return [_direct(prompts[0])]
         body = "\n".join(f"[{i}] {s}" for i, s in enumerate(prompts))
@@ -246,19 +323,12 @@ def _microbatch_runner(model_id, think_mode, extra_fields, instruction=""):
         parsed = {}
         try:
             out = generate(packed, model_id, think_mode, None, extra_fields)
-            cur, buf = None, []
-            for line in (out or "").splitlines():
-                m = re.match(r"^\[(\d+)\]\s*(.*)$", line)
-                if m and 0 <= int(m.group(1)) < len(prompts):
-                    if cur is not None:
-                        parsed[cur] = "\n".join(buf).strip()
-                    cur, buf = int(m.group(1)), [m.group(2)]
-                elif cur is not None:
-                    buf.append(line)
-            if cur is not None:
-                parsed[cur] = "\n".join(buf).strip()
+            parsed = parse_numbered_translations(out, len(prompts))
         except Exception as e:
-            log(f"Microbatch upstream error: {e}")
+            # generate already exhausted its classified retry policy. Replaying
+            # as individual segments would bypass Retry-After and amplify load.
+            log(f"Microbatch upstream error: {type(e).__name__}")
+            raise
         results = []
         for i, prompt in enumerate(prompts):
             if i in parsed and parsed[i]:
@@ -267,6 +337,12 @@ def _microbatch_runner(model_id, think_mode, extra_fields, instruction=""):
                 results.append(_direct(prompt))
         return results
 
+    def _run(prompts):
+        """Preserve one budget across batch and fallbacks. Args: prompts. Returns: texts."""
+        with budget_scope():
+            return _execute(prompts)
+
+    _run.overhead_chars = len(prefix) + 512
     return _run
 
 

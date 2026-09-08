@@ -6,18 +6,33 @@ import urllib.parse
 import uuid
 
 from ..config import CONFIG
-from .cookies import _active_auth_user, load_cookie
+from .cookies import _active_auth_user, get_active_xsrf_token, load_cookie
 from .transport import CHROME_UA
 
 
 def make_sapisidhash(sapisid: str) -> str:
+    """Build the timestamped Gemini SAPISID authorization header.
+
+    Args:
+        sapisid: SAPISID cookie value for the active account.
+
+    Returns:
+        Formatted SAPISIDHASH header value.
+    """
     ts = int(time.time())
     h = hashlib.sha1(f"{ts} {sapisid} https://gemini.google.com".encode()).hexdigest()
     return f"SAPISIDHASH {ts}_{h}"
 
 
 def _account_prefix() -> str:
-    """Return the Gemini account path prefix for non-default Google accounts."""
+    """Resolve the selected cookie before choosing a Gemini account prefix.
+
+    Args:
+        None.
+
+    Returns:
+        Account path prefix, or an empty string for the default account.
+    """
     auth_user = _active_auth_user()
     if auth_user is None or auth_user == "":
         return ""
@@ -27,7 +42,7 @@ def _account_prefix() -> str:
 def _build_headers(uuid_val: str = None) -> dict:
     """Build request headers for StreamGenerate.
 
-    Parameters:
+    Args:
         uuid_val: request uuid shared with inner[59] of the payload. When
             set, it is also sent as the x-goog-ext-525005358-jspb header
             (["<uuid>",1]) like the current web client, which binds the
@@ -36,6 +51,7 @@ def _build_headers(uuid_val: str = None) -> dict:
     Returns:
         Header dict for the StreamGenerate POST.
     """
+    cookie_str, sapisid = load_cookie()
     account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -48,7 +64,6 @@ def _build_headers(uuid_val: str = None) -> dict:
         headers["x-goog-ext-525005358-jspb"] = f'["{uuid_val}",1]'
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(_active_auth_user())
-    cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
     if sapisid:
@@ -57,7 +72,14 @@ def _build_headers(uuid_val: str = None) -> dict:
 
 
 def _apply_chat_persistence_flags(inner: list) -> None:
-    """Apply Gemini Web persistence flags to an outgoing request payload."""
+    """Apply Gemini Web persistence flags to an outgoing request payload.
+
+    Args:
+        inner: Mutable Gemini request payload slots.
+
+    Returns:
+        None.
+    """
     if CONFIG.get("temporary_chats", False):
         # Match Gemini Web temporary-chat requests.
         inner[41] = [1]
@@ -69,7 +91,7 @@ def _apply_chat_persistence_flags(inner: list) -> None:
 def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, uuid_val: str = None) -> str:
     """Build the urlencoded f.req payload for StreamGenerate.
 
-    Parameters:
+    Args:
         prompt: user prompt text.
         model_id: MODE_CATEGORY id (1=FAST, 2=THINKING, 3=PRO, 4=AUTO...).
         think_mode: thinking level (0=dynamic, 4=default).
@@ -88,11 +110,11 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
         # kind: 1=image, 2=video, 3=text. Shorter shapes (e.g. [[ref], name])
         # upload fine but the generate call is rejected with
         # BardErrorInfo [1100].
-        refs = [
-            [[ref, 1, None, "image/png"], "image.png",
-             None, None, None, None, None, None, [0]]
-            for ref in file_refs
-        ]
+        refs = []
+        for ref in file_refs:
+            mime_type = getattr(ref, "mime_type", "image/png") or "image/png"
+            refs.append([[str(ref), 1, None, mime_type], "image.png",
+                         None, None, None, None, None, None, [0]])
         inner[0] = [prompt, 0, None, refs, None, None, 0]
     else:
         inner[0] = [prompt, 0, None, None, None, None, 0]
@@ -117,12 +139,21 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
             inner[k] = v
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
-    if CONFIG.get("xsrf_token"):
-        params["at"] = CONFIG["xsrf_token"]
+    xsrf_token = get_active_xsrf_token()
+    if xsrf_token:
+        params["at"] = xsrf_token
     return urllib.parse.urlencode(params)
 
 
 def _get_url() -> str:
+    """Construct the generation endpoint for the resolved active account.
+
+    Args:
+        None.
+
+    Returns:
+        StreamGenerate URL with build and request-id parameters.
+    """
     reqid = int(time.time() * 1000) % 1000000
     account_prefix = _account_prefix()
     return (
@@ -133,6 +164,14 @@ def _get_url() -> str:
 
 
 def _delete_url() -> str:
+    """Construct the history endpoint for the resolved active account.
+
+    Args:
+        None.
+
+    Returns:
+        Batchexecute URL with account, RPC, build and request-id fields.
+    """
     reqid = int(time.time() * 1000) % 1000000
     account_prefix = _account_prefix()
     return (

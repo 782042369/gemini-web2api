@@ -7,6 +7,9 @@ transparent to callers; HAS_HTTPX / HAS_CURL_CFFI report availability.
 import ssl
 import threading
 import urllib.request
+from contextlib import contextmanager
+
+from ..budget import check_budget, remaining_timeout
 
 from ..config import CONFIG
 
@@ -76,12 +79,65 @@ def get_browser_session():
     return s
 
 
+@contextmanager
+def curl_total_timeout(session, seconds):
+    """Set a real libcurl wall-clock bound, including streaming header waits.
+
+    Args:
+        session: Thread-local curl_cffi session; fake/absent transports are left alone.
+        seconds: Positive maximum duration for this single transport operation.
+
+    Yields:
+        None. Restores existing session options so later requests are unaffected.
+    """
+    options = getattr(session, "curl_options", None)
+    if not HAS_CURL_CFFI or not isinstance(options, dict):
+        yield
+        return
+    from curl_cffi import CurlOpt
+    sentinel = object()
+    previous = options.get(CurlOpt.TIMEOUT_MS, sentinel)
+    milliseconds = max(1, int(seconds * 1000))
+    if isinstance(previous, (int, float)) and previous > 0:
+        milliseconds = min(milliseconds, previous)
+    options[CurlOpt.TIMEOUT_MS] = milliseconds
+    try:
+        yield
+    finally:
+        if previous is sentinel:
+            options.pop(CurlOpt.TIMEOUT_MS, None)
+        else:
+            options[CurlOpt.TIMEOUT_MS] = previous
+
+
+def read_urllib_response(response, stage):
+    """Read a fallback response cooperatively under the current request budget.
+
+    Args:
+        response: urllib HTTPResponse with read1 support.
+        stage: Safe timeout stage name.
+
+    Returns:
+        Complete response bytes; checks the budget between raw reads. DNS and
+        urllib header parsing still rely on their underlying socket timeout.
+    """
+    chunks = []
+    while True:
+        check_budget(stage)
+        chunk = response.read1(65536)
+        check_budget(stage)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
 def _urllib_post(url: str, body: bytes, headers: dict, timeout=None) -> str:
     """Fallback POST via urllib (no connection pooling), used when httpx is absent."""
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     proxy = CONFIG.get("proxy")
     ctx = _get_ssl_ctx()
-    to = timeout if isinstance(timeout, (int, float)) else CONFIG["request_timeout_sec"]
+    to = remaining_timeout(timeout if isinstance(timeout, (int, float)) else CONFIG["request_timeout_sec"],
+                           "upstream request")
     if proxy:
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
@@ -90,4 +146,5 @@ def _urllib_post(url: str, body: bytes, headers: dict, timeout=None) -> str:
         resp = opener.open(req, timeout=to)
     else:
         resp = urllib.request.urlopen(req, context=ctx, timeout=to)
-    return resp.read().decode("utf-8", errors="replace")
+    with resp:
+        return read_urllib_response(resp, "upstream response").decode("utf-8", errors="replace")

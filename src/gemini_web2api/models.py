@@ -1,5 +1,7 @@
 """Model definitions and mapping from Gemini frontend JS source."""
 
+from .config import CONFIG
+
 # MODE_CATEGORY enum from 028-6eb337387583.js:
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
@@ -47,12 +49,17 @@ MODELS = {
 }
 
 
-def resolve_model(model_name: str, default: str = "gemini-3.8-flash"):
+def resolve_model(model_name: str, default: str = None):
     """Resolve model name to (name, mode_id, think_mode, error, extra_fields).
 
     Unknown model names fall back to default rather than erroring,
     since upstream clients may request arbitrary model identifiers.
     """
+    if not isinstance(model_name, str) or not model_name.strip():
+        return None, None, None, "model must be a non-empty string", None
+    default = default or CONFIG.get("default_model", "gemini-3.8-flash")
+    if default not in MODELS:
+        default = "gemini-3.8-flash"
     think_override = None
     if "@think=" in model_name:
         model_name, think_str = model_name.rsplit("@think=", 1)
@@ -60,6 +67,8 @@ def resolve_model(model_name: str, default: str = "gemini-3.8-flash"):
             think_override = int(think_str)
         except ValueError:
             return None, None, None, f"Invalid think level: {think_str}", None
+        if think_override < 0 or think_override > 4:
+            return None, None, None, "Think level must be between 0 and 4", None
     cfg = MODELS.get(model_name)
     if not cfg:
         from .logs import log

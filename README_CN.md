@@ -21,6 +21,10 @@
 - **Codex CLI**: Responses API (`/v1/responses`) 兼容 OpenAI Codex
 - **Gemini CLI**: Google 原生 API (`/v1beta/models`) 兼容 Gemini CLI
 
+## 可靠性与安全
+
+详见[加固与验证说明](docs/HARDENING.md)：请求体限额、账号隔离、真实文本流式、远程图片限制（包括代理兼容性）、离线测试与尚存的运维边界。源码修改不会自动更新生产容器。
+
 ## 快速开始
 
 源码运行:

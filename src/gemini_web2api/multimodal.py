@@ -1,30 +1,40 @@
 """Multimodal: browser-aligned two-step Scotty resumable upload."""
+import os
 import urllib.request
 import urllib.parse
 import time
 import re
-from urllib.parse import urlparse
+import threading
 
 from .config import CONFIG
+from .budget import RequestControlError, budget_lock, check_budget, remaining_timeout
+from .image_fetch import fetch_image_bytes as fetch_image_bytes
 from .logs import log
-from .upstream.cookies import load_cookie
+from .upstream.cookies import _active_auth_user, _active_cookie_path, load_cookie
 from .upstream.protocol import make_sapisidhash
-from .upstream.transport import CHROME_UA, _get_ssl_ctx, get_browser_session
+from .upstream.transport import (CHROME_UA, _get_ssl_ctx, get_browser_session,
+                                 curl_total_timeout, read_urllib_response)
 
 
 def _get_page_tokens() -> dict:
     """Fetch WIZ_global_data tokens from the Gemini app page.
 
     Returns:
-        dict with "push_id" (qKIAYe), "pctx" (Ylro7b) and "at" (thykhd)
+        dict with "push_id" (qKIAYe), "pctx" (Ylro7b) and "at" (SNlM0e)
         when present; {} on failure. The push_id binds uploads to the
         signed-in account's storage bucket - without it an upload would
         land in the anonymous bucket whose references StreamGenerate
         rejects with BardErrorInfo 1100.
     """
+    check_budget("image session refresh")
+    auth_user = _active_auth_user()
+    account_prefix = f"/u/{auth_user}" if auth_user not in (None, "") else ""
     headers = {
         "User-Agent": CHROME_UA,
+        "Referer": f"https://gemini.google.com{account_prefix}/app",
     }
+    if account_prefix:
+        headers["X-Goog-AuthUser"] = str(auth_user)
     cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
@@ -33,20 +43,27 @@ def _get_page_tokens() -> dict:
     try:
         sess = get_browser_session()
         if sess is not None:
-            resp = sess.get("https://gemini.google.com/app", headers=headers, timeout=30)
-            html = resp.text
+            timeout = remaining_timeout(30, "image session refresh")
+            with curl_total_timeout(sess, timeout):
+                resp = sess.get(f"https://gemini.google.com{account_prefix}/app", headers=headers, timeout=timeout)
+                try:
+                    check_budget("image session refresh")
+                    html = resp.text
+                finally:
+                    resp.close()
         else:
-            req = urllib.request.Request("https://gemini.google.com/app", headers=headers)
+            req = urllib.request.Request(f"https://gemini.google.com{account_prefix}/app", headers=headers)
             proxy = CONFIG.get("proxy")
             if proxy:
                 opener = urllib.request.build_opener(
                     urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
                     urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
                 )
-                resp = opener.open(req, timeout=30)
+                resp = opener.open(req, timeout=remaining_timeout(30, "image session refresh"))
             else:
-                resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
-            html = resp.read().decode()
+                resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=remaining_timeout(30, "image session refresh"))
+            with resp:
+                html = read_urllib_response(resp, "image session refresh").decode()
         tokens = {}
         for key, pattern in [
             ("push_id", r'"qKIAYe":"([^"]+)"'),
@@ -57,25 +74,46 @@ def _get_page_tokens() -> dict:
             if m:
                 tokens[key] = m.group(1)
         return tokens
+    except RequestControlError:
+        raise
     except Exception as e:
+        check_budget("image session refresh")
         log(f"Page token fetch failed: {e}")
         return {}
 
 
-_page_tokens_cache = {"tokens": {}, "ts": 0}
+_page_tokens_cache = {}  # (cookie path, auth_user) -> tokens, freshness, lock
+_page_tokens_lock = threading.RLock()
 
 
 def _cached_page_tokens() -> dict:
-    """Return page tokens refreshed at most every 600s.
+    """Fetch tokens once per account without blocking unrelated image accounts.
+
+    Args:
+        None; account context is bound to the current request thread.
 
     Returns:
-        Cached token dict (see _get_page_tokens).
+        Tokens for the selected account. Complete upload tokens are cached for
+        600 seconds, failed/incomplete fetches for only 30 seconds. A cookie-file
+        change invalidates the entry immediately.
     """
-    now = time.time()
-    if now - _page_tokens_cache["ts"] > 600:
-        _page_tokens_cache["tokens"] = _get_page_tokens()
-        _page_tokens_cache["ts"] = now
-    return _page_tokens_cache["tokens"]
+    path = _active_cookie_path() or "__anonymous__"
+    key = (path, _active_auth_user())
+    with _page_tokens_lock:
+        cache = _page_tokens_cache.setdefault(key, {"tokens": {}, "ts": None,
+                                                   "mtime": None, "lock": threading.Lock()})
+    with budget_lock(cache["lock"], "image session cache"):
+        now = time.monotonic()
+        try:
+            cookie_mtime = os.path.getmtime(path) if path != "__anonymous__" else 0.0
+        except OSError:
+            cookie_mtime = 0.0
+        ttl = 600 if cache["tokens"].get("push_id") and cache["tokens"].get("at") else 30
+        if cache["ts"] is not None and now - cache["ts"] < ttl and cache["mtime"] == cookie_mtime:
+            return dict(cache["tokens"])
+        tokens = _get_page_tokens()
+        cache.update(tokens=tokens, ts=time.monotonic(), mtime=cookie_mtime)
+        return dict(tokens)
 
 
 def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
@@ -111,36 +149,6 @@ def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
     return fallback
 
 
-def fetch_image_bytes(url: str) -> bytes:
-    """Fetch image bytes from an http(s) URL.
-
-    Parameters:
-        url: image URL to download.
-
-    Returns:
-        Raw image bytes, or b"" on unsupported scheme / failure.
-    """
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        log(f"Image fetch skipped for unsupported URL scheme: {parsed.scheme or 'none'}")
-        return b""
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        proxy = CONFIG.get("proxy")
-        if proxy:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
-            )
-            resp = opener.open(req, timeout=30)
-        else:
-            resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
-        return resp.read()
-    except Exception as e:
-        log(f"Image fetch failed: {e}")
-        return b""
-
-
 def _sanitize_upload_name(name: str) -> str:
     """Strip characters that would break the start-request body.
 
@@ -168,10 +176,16 @@ def _upload_post(url: str, headers: dict, data: bytes):
     Raises:
         RuntimeError: on transport failure.
     """
+    timeout = remaining_timeout(90, "image upload")
     sess = get_browser_session()
     if sess is not None:
-        resp = sess.post(url, headers=headers, data=data, timeout=90)
-        return resp.status_code, {k.lower(): v for k, v in resp.headers.items()}, resp.text
+        with curl_total_timeout(sess, timeout):
+            resp = sess.post(url, headers=headers, data=data, timeout=timeout)
+            try:
+                check_budget("image upload")
+                return resp.status_code, {k.lower(): v for k, v in resp.headers.items()}, resp.text
+            finally:
+                resp.close()
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     proxy = CONFIG.get("proxy")
     if proxy:
@@ -179,12 +193,13 @@ def _upload_post(url: str, headers: dict, data: bytes):
             urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
             urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
         )
-        resp = opener.open(req, timeout=90)
+        resp = opener.open(req, timeout=timeout)
     else:
-        resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=90)
-    body = resp.read().decode("utf-8", "replace")
-    heads = {k.lower(): v for k, v in resp.headers.items()}
-    return resp.status, heads, body
+        resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=timeout)
+    with resp:
+        body = read_urllib_response(resp, "image upload").decode("utf-8", "replace")
+        heads = {k.lower(): v for k, v in resp.headers.items()}
+        return resp.status, heads, body
 
 
 def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str = "image/png") -> str:
@@ -222,14 +237,19 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
     pctx = tokens.get("pctx")
 
     cookie_str, sapisid = load_cookie()
+    check_budget("image session refresh")
+    auth_user = _active_auth_user()
+    account_prefix = f"/u/{auth_user}" if auth_user not in (None, "") else ""
     base = {
         "Origin": "https://gemini.google.com",
-        "Referer": "https://gemini.google.com/",
+        "Referer": f"https://gemini.google.com{account_prefix}/app",
         "X-Tenant-Id": "bard-storage",
         "Push-ID": push_id,
         "Accept": "*/*",
         "User-Agent": CHROME_UA,
     }
+    if account_prefix:
+        base["X-Goog-AuthUser"] = str(auth_user)
     if pctx:
         base["X-Client-Pctx"] = pctx
     if cookie_str:

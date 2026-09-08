@@ -4,6 +4,11 @@
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
+  "request_deadline_sec": 180,
+  "queue_timeout_sec": 30,
+  "max_queued_requests": 64,
+  "translation_batch_max_chars": 12000,
+  "translation_batch_max_segments": 25,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
@@ -22,5 +27,9 @@
   "slow_retry_sec": 60,
   "impersonate": "chrome",
   "log_file": null,
-  "log_retention_days": 7
+  "log_retention_days": 7,
+  "max_request_body_bytes": 16777216,
+  "max_image_bytes": 20971520,
+  "request_body_timeout_sec": 30,
+  "allow_private_image_urls": false
 }

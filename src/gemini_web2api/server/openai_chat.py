@@ -16,21 +16,38 @@ class OpenAIChatMixin:
 
 
     def _handle_chat(self, body: bytes):
+        """Handle Chat input. Args: body contains JSON bytes. Returns: None; writes one response."""
         req = self._parse_body(body)
         if req is None:
-            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            self.send_error_json("request body must be a JSON object", 400, param="body")
             return
-        model_name, model_id, think_mode, err, extra_fields = resolve_model(
-            req.get("model", CONFIG["default_model"]))
+        if not self._validate_request(req, "chat"):
+            return
+        requested_model = req.get("model", CONFIG["default_model"])
+        if not isinstance(requested_model, str) or not requested_model.strip():
+            self.send_error_json("model must be a non-empty string", 400, param="model")
+            return
+        messages = req.get("messages")
+        if not isinstance(messages, list) or not messages or any(not isinstance(item, dict) for item in messages):
+            self.send_error_json("messages must be a non-empty array of objects", 400, param="messages")
+            return
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(requested_model)
         if err:
-            self.send_json({"error": {"message": err}}, 400)
+            self.send_error_json(err, 400, param="model")
             return
 
         tools = req.get("tools")
+        if tools is not None and not isinstance(tools, list):
+            self.send_error_json("tools must be an array", 400, param="tools")
+            return
         tool_choice = req.get("tool_choice", "auto")
-        prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
+        try:
+            prompt, images = messages_to_prompt(messages, tools, tool_choice)
+        except (TypeError, ValueError, KeyError) as e:
+            self.send_error_json(f"invalid messages: {e}", 400, param="messages")
+            return
         if not prompt.strip():
-            self.send_json({"error": {"message": "empty prompt"}}, 400)
+            self.send_error_json("empty prompt", 400, param="messages")
             return
 
         stream = req.get("stream", False)
@@ -38,7 +55,7 @@ class OpenAIChatMixin:
         try:
             file_refs = _upload_images(images)
         except RuntimeError as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self._send_upstream_error(e, code="image_upload_failed")
             return
 
         if stream and (not tools or tool_choice == "none"):
@@ -70,18 +87,33 @@ class OpenAIChatMixin:
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
-                log(f"Stream error: {e}")
+                log(f"Stream error: {type(e).__name__}: {e}")
+                try:
+                    if self._resp_status is None:
+                        self._send_upstream_error(e)
+                    else:
+                        self._write_stream_error("chat", error=e)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             return
 
         try:
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self._send_upstream_error(e, code="upstream_error")
             return
 
         tool_calls = None
         if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
+            allowed_names = set()
+            for tool in tools:
+                if isinstance(tool, dict):
+                    fn = tool.get("function", tool)
+                    if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+                        allowed_names.add(fn["name"])
+            if isinstance(tool_choice, dict):
+                allowed_names &= {tool_choice.get("function", tool_choice)["name"]}
+            text, tool_calls = parse_tool_calls(text, allowed_names)
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls

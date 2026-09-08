@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 semver.
 
+## [Unreleased]
+
+### Pending: retry, deadline and translation-batch optimization
+
+- Classify transient HTTP/transport failures using metadata; stop unchanged Bard refusals, permanent failures, and all retries after streamed text. Honor Retry-After within a single request budget.
+- Add request_deadline_sec, queue_timeout_sec and max_queued_requests; propagate remaining time through coalescing, batch workers, downloads, session refresh, uploads and generation. Restore native curl timeout options and always release acquired slots.
+- Add translation_batch_max_chars and translation_batch_max_segments; preserve long singleton paragraphs while preventing oversized combined groups.
+- Add focused queue/cancellation/deadline and character-budget tests. The offline runner now includes pytest parameterized tests rather than only unittest discovery.
+- These follow-up changes are not deployed. A later user-provided Cookie and fresh XSRF token restored one live vision check on the existing image; see docs/SMOKE_REPORT.md for evidence and limitations.
+
+### Core translation and image understanding
+
+- Preserve multiline translations and source indexes; retry missing/duplicate segments and report failures instead of returning untranslated source as success.
+- Respect account identity, per-group size and the lone-request fast path in translation microbatching.
+- Reject malformed image data before generation, preserve detected MIME and shorten recovery from failed image session-token fetches.
+- Keep additional API feature expansion out of scope; focus improvements on translation and image understanding.
+
+### Security and reliability
+
+- Match API routes exactly and validate nested protocol inputs before upstream side effects.
+- Bound request bodies with strict chunk framing and a total read deadline.
+- Pin image download connections to validated DNS answers; preserve HTTPS server identity, reject redirects, limit bytes/time and close resources on all exits. Remote URL images now fail closed when an application proxy is configured; inline images remain supported.
+- Isolate account XSRF, auth-user context and persistence; serialize in-process cookie read/modify/write operations and keep keepalive startup retryable.
+- Stream Responses text deltas before completion; send explicit terminal errors on partial Chat/Google/Responses streams without falsely reporting success.
+- Preserve Responses function-call input history and constrain parsed calls to declared functions with valid JSON-object arguments.
+
+### Verification
+
+- Add adversarial wire-contract, account persistence and image download regressions.
+- Guard unittest/pytest against accidental external network traffic; use the guarded runner in Make and CI.
+- Add pull-request validation and compile/package-build checks; do not publish Docker images from pull requests.
+- Document limits, incompatible proxy-image cases and remaining operational risks in docs/HARDENING.md.
+
 ## [1.2.1] - 2026-09-05
 
 ### Changed - streaming pipeline deduplication (behavior-preserving)
