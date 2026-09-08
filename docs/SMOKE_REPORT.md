@@ -1,6 +1,14 @@
 # Production restart and core-function smoke test
 
-## Latest update: credential refresh + container restart (2026-09-08 12:40–12:41 +08:00)
+## Latest update: browser-parity hardening deployed (2026-09-08 22:54 +08:00)
+
+Supersedes prior status below; earlier sections remain as historical evidence.
+
+- Deployed image `3046b7266abb` (commit 8ced1bc): StreamGenerate now carries `f.sid` + live `cfb2h` bl + model-selection headers; image upload prefers one-shot `content-push` multipart (log line `Image uploaded via content-push multipart` confirms it is live); impersonation pinned to `chrome145`.
+- Text probe after deploy: 200 in 2.3s, reply intact.
+- Vision probe: still `BardErrorInfo [1100]` (0.5s fail-fast). Full client-side parity with HanaokaYuzu/Gemini-API is now in place; the remaining blocker is the upstream file-pipeline change documented in docs/INCIDENT-20260908-vision.md. When Google restores the pipeline this exact chain is expected to recover without further code changes.
+
+## Prior: credential refresh + container restart (2026-09-08 12:40–12:41 +08:00)
 
 Supersedes prior status below; earlier sections remain as historical evidence.
 
