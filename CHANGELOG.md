@@ -6,6 +6,11 @@ semver.
 
 ## [Unreleased]
 
+### Vision restored via CDP browser bridge (2026-09-10)
+
+- New `vision_bridge` module: image-bearing chat requests are executed inside a CDP-attached, logged-in Gemini tab (upload → ProcessFile with the live `at` token → StreamGenerate), the only environment the upstream still issues XSRF tokens to. Configured via `vision_bridge_url`; absent/None keeps the direct chain.
+- Adds `websocket-client` dependency; bridge hostnames are resolved to IPs to satisfy Chrome's DevTools Host-header check.
+
 ### Browser-parity hardening (2026-09-08, from HanaokaYuzu/Gemini-API)
 
 - StreamGenerate now sends the live page session id as `f.sid` and the freshest frontend build label (`cfb2h`) instead of the static config `gemini_bl`, plus the model-selection envelope headers (`x-goog-ext-525001261-jspb`, `73010989`, `73010990`).

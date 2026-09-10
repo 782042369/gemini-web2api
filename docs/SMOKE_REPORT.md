@@ -1,6 +1,15 @@
 # Production restart and core-function smoke test
 
-## Latest update: browser-parity hardening deployed (2026-09-08 22:54 +08:00)
+## Latest update: VISION RESTORED via CDP browser bridge (2026-09-10 01:5x +08:00)
+
+Supersedes prior status below; earlier sections remain as historical evidence.
+
+- Root cause chain closed: the upstream only hands the XSRF token (SNlM0e) to a genuinely signed-in browser session, so all server-side forged chains fail with BardErrorInfo 1100 (see docs/INCIDENT-20260908-vision.md).
+- Fix: new `vision_bridge` module routes image-bearing `/v1/chat/completions` requests through a CDP-attached, logged-in Gemini tab (llq desktop Chrome). The page executes upload → ProcessFile (at token, receives attachment UUID) → StreamGenerate, exactly mirroring the web client.
+- Production evidence: image request 200 in 5.8s with an accurate logo description; streaming image request returns "**API**"; text regression intact ("正常"). Config: `vision_bridge_url: http://llq-cdp-bridge:22` (served by the socat bridge chain into the chrome-net).
+- Ops notes: the llq Chrome CDP instance runs with `--user-data-dir=/root/chrome-cdp-profile --remote-debugging-port=9222`; its supervisor respawns the original instance, so the CDP one must run in parallel; the host-side forwarder (llq-cdp-bridge container) is `--restart unless-stopped`.
+
+## Prior: browser-parity hardening deployed (2026-09-08 22:54 +08:00)
 
 Supersedes prior status below; earlier sections remain as historical evidence.
 

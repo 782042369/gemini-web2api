@@ -36,6 +36,11 @@ DEFAULT_CONFIG = {
     # chrome145 pins the profile HanaokaYuzu/Gemini-API uses to avoid
     # Google's Device Bound Session Credentials experiment on newer profiles.
     "impersonate": "chrome145",
+    # CDP vision bridge: base URL of a Chrome DevTools endpoint whose
+    # browser holds a genuinely logged-in Gemini tab (see docs/INCIDENT-
+    # 20260908-vision.md). Image-bearing requests are executed inside that
+    # tab. None/empty disables the bridge and keeps the direct chain.
+    "vision_bridge_url": None,
     # Transparent micro-batching of short single-segment generateContent
     # requests (companion plugins firing burst translations). 0 disables.
     # Active session keepalive: rotate PSIDTS + refresh SNlM0e every N

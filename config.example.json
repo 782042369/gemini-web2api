@@ -26,6 +26,7 @@
   "keep_warm_interval_sec": 0,
   "slow_retry_sec": 60,
   "impersonate": "chrome145",
+  "vision_bridge_url": null,
   "log_file": null,
   "log_retention_days": 7,
   "max_request_body_bytes": 16777216,

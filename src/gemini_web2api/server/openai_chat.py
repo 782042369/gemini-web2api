@@ -8,12 +8,58 @@ from ..logs import log
 from ..models import resolve_model
 from ..tools import messages_to_prompt, parse_tool_calls
 from ..upstream import generate, generate_stream
+from ..upstream.parser import extract_response_text
+from ..vision_bridge import vision_bridge_enabled, vision_generate
 from .images import _upload_images
 
 
 class OpenAIChatMixin:
     """Handler methods for the /v1/chat/completions endpoint."""
 
+
+    def _chat_via_vision_bridge(self, prompt, images, model_name, cid, stream):
+        """Serve one image request through the CDP browser bridge.
+
+        Args:
+            prompt: user prompt text.
+            images: list of (image_bytes, mime) tuples.
+            model_name: requested model name for the response envelope.
+            cid: chatcmpl id.
+            stream: whether the client asked for SSE.
+
+        Returns:
+            None; writes one complete (or single-chunk SSE) response.
+        """
+        try:
+            sg_raw = vision_generate(prompt, images)
+            text = extract_response_text(sg_raw)
+        except Exception as e:
+            self._send_upstream_error(e, code="vision_bridge_failed")
+            return
+        if not text:
+            self._send_upstream_error("vision bridge produced empty text", code="vision_bridge_failed")
+            return
+        msg = {"role": "assistant", "content": text}
+        if stream:
+            self._start_sse()
+            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                     "model": model_name,
+                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": text},
+                                  "finish_reason": "stop"}]}
+            try:
+                self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        else:
+            self.send_json({
+                "id": cid, "object": "chat.completion", "created": int(time.time()),
+                "model": model_name,
+                "choices": [{"index": 0, "message": msg, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": len(prompt) // 4, "completion_tokens": len(text) // 4,
+                          "total_tokens": (len(prompt) + len(text)) // 4},
+            })
 
     def _handle_chat(self, body: bytes):
         """Handle Chat input. Args: body contains JSON bytes. Returns: None; writes one response."""
@@ -52,6 +98,15 @@ class OpenAIChatMixin:
 
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+
+        # Vision bridge: image-bearing requests are executed inside the
+        # logged-in Gemini tab of the CDP browser (the only environment the
+        # upstream still hands a valid XSRF token to). Falls through to the
+        # direct chain when the bridge is not configured.
+        if images and vision_bridge_enabled():
+            self._chat_via_vision_bridge(prompt, images, model_name, cid, stream)
+            return
+
         try:
             file_refs = _upload_images(images)
         except RuntimeError as e:
