@@ -11,6 +11,7 @@ import base64
 import json
 import socket
 import threading
+import time
 import urllib.request
 
 from .config import CONFIG
@@ -253,3 +254,247 @@ def vision_generate(prompt: str, images: list) -> str:
             ws.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Page-token sourcing: lend the direct chain the browser-only XSRF token.
+# ---------------------------------------------------------------------------
+# The server-side chain can upload files and call StreamGenerate on its own
+# TLS session, but Google embeds the XSRF token (at/SNlM0e) only in pages
+# served to the genuinely logged-in browser session (device-bound via
+# DBSC for this account). fetch_page_tokens() reads the live tokens from
+# the CDP tab so the direct chain can borrow them. It is wedge-tolerant:
+# a tab whose renderer stopped answering is replaced with a freshly
+# created one and the corpse is closed. Successes and failures are both
+# cached so callers never hammer the browser.
+
+_TOKEN_JS = (
+    '(function(){var s=document.documentElement.innerHTML;'
+    'function f(p){var m=s.match(p);return m?m[1]:null};'
+    'return JSON.stringify({'
+    'at:f(/"SNlM0e":"([^"]+)"/),'
+    'push:f(/"qKIAYe":"([^"]+)"/),'
+    'pctx:f(/"Ylro7b":"([^"]+)"/),'
+    'fsid:f(/"FdrFJe":"([^"]+)"/),'
+    'bl:f(/"cfb2h":"([^"]+)"/)})})()'
+)
+
+_BRIDGE_TOKEN_TTL = 300.0       # success: seconds borrowed tokens are reused
+_BRIDGE_TOKEN_FAIL_TTL = 120.0  # failure: cooldown before touching CDP again
+_BRIDGE_EVAL_TIMEOUT = 20.0     # per-tab evaluate; wedged tabs exceed this
+
+_bridge_token_state = {"tokens": None, "ts": 0.0, "fail_ts": 0.0}
+_bridge_token_lock = threading.Lock()
+
+
+def _tab_ws(tab: dict, timeout: float):
+    """Open a DevTools websocket to one tab with the bridge host rewritten.
+
+    Args:
+        tab: target descriptor from /json/list.
+        timeout: websocket timeout in seconds.
+
+    Returns:
+        Connected websocket client.
+
+    Raises:
+        VisionBridgeError: when the connection cannot be established.
+    """
+    import websocket
+    from urllib.parse import urlparse
+    _, host, port = _bridge_endpoint()
+    ws_url = tab["webSocketDebuggerUrl"]
+    wp = urlparse(ws_url)
+    ws_url = ws_url.replace(f"{wp.hostname}:{wp.port or 9222}", f"{host}:{port}", 1)
+    return websocket.create_connection(ws_url, timeout=timeout, suppress_origin=True)
+
+
+def _tab_evaluate(tab: dict, js: str, timeout: float):
+    """Run one Runtime.evaluate on a tab and return its JSON value.
+
+    Args:
+        tab: target descriptor.
+        js: expression to evaluate.
+        timeout: total wait; exceeding it means the tab is wedged.
+
+    Returns:
+        Parsed value, or None when the expression returned nothing.
+
+    Raises:
+        Exception: transport/timeout errors (caller treats as wedge).
+    """
+    ws = _tab_ws(tab, timeout)
+    try:
+        ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                            "params": {"expression": js, "awaitPromise": True,
+                                        "returnByValue": True}}))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = json.loads(ws.recv())
+            if msg.get("id") == 1:
+                result = msg.get("result", {})
+                if "exceptionDetails" in result:
+                    raise VisionBridgeError("token evaluate raised in page")
+                return result.get("result", {}).get("value")
+        raise TimeoutError(f"evaluate on {tab.get('targetId', '?')} timed out")
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def _close_tabs(target_ids: list) -> None:
+    """Close tabs by target id through the browser-level DevTools socket.
+
+    Args:
+        target_ids: targetId strings to close; failures are ignored.
+
+    Returns:
+        None.
+    """
+    if not target_ids:
+        return
+    try:
+        ver = _cdp_http("/json/version")
+        ws = _tab_ws({"webSocketDebuggerUrl": ver["webSocketDebuggerUrl"]}, 15)
+    except Exception:
+        return
+    try:
+        for i, tid in enumerate(target_ids):
+            ws.send(json.dumps({"id": i + 1, "method": "Target.closeTarget",
+                                "params": {"targetId": tid}}))
+            time.sleep(0.2)
+    except Exception:
+        pass
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def _open_fresh_gemini_tab() -> dict:
+    """Create a new tab and navigate it to the Gemini app page.
+
+    Args:
+        None.
+
+    Returns:
+        The new tab descriptor once /json/list reports it on the app URL.
+
+    Raises:
+        VisionBridgeError: when creation or navigation does not settle.
+    """
+    ver = _cdp_http("/json/version")
+    ws = _tab_ws({"webSocketDebuggerUrl": ver["webSocketDebuggerUrl"]}, 30)
+    target_id = None
+    try:
+        ws.send(json.dumps({"id": 1, "method": "Target.createTarget",
+                            "params": {"url": "about:blank"}}))
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            msg = json.loads(ws.recv())
+            if msg.get("id") == 1:
+                target_id = msg.get("result", {}).get("targetId")
+                break
+        if not target_id:
+            raise VisionBridgeError("Target.createTarget returned no id")
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+    for tab in _cdp_http("/json/list"):
+        if tab.get("id") == target_id and tab.get("type") == "page":
+            _tab_evaluate(tab,
+                          "location.href !== 'https://gemini.google.com/app'"
+                          " && location.assign('https://gemini.google.com/app')",
+                          _BRIDGE_EVAL_TIMEOUT)
+            break
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        for tab in _cdp_http("/json/list"):
+            if (tab.get("id") == target_id and tab.get("type") == "page"
+                    and "gemini.google.com" in tab.get("url", "")):
+                time.sleep(3)  # let WIZ_global_data settle
+                return tab
+        time.sleep(1)
+    raise VisionBridgeError("fresh Gemini tab did not navigate")
+
+
+def _fetch_page_tokens_now() -> dict:
+    """Read live page tokens from the browser, replacing wedged tabs.
+
+    Args:
+        None.
+
+    Returns:
+        Dict with at/push_id/pctx/f_sid/bl (mapped names); values missing
+        from the page (e.g. at when logged out) are absent. Transport
+        failures raise VisionBridgeError.
+    """
+    wedged = []
+    tabs = [t for t in _cdp_http("/json/list")
+            if t.get("type") == "page" and "gemini.google.com" in t.get("url", "")]
+    for tab in reversed(tabs):  # newest first: old tabs are wedged corpses
+        try:
+            raw = _tab_evaluate(tab, _TOKEN_JS, _BRIDGE_EVAL_TIMEOUT)
+        except Exception:
+            wedged.append(tab.get("id"))
+            continue
+        if isinstance(raw, str) and raw.startswith("{"):
+            data = json.loads(raw)
+            tokens = {"at": data.get("at"), "push_id": data.get("push"),
+                      "pctx": data.get("pctx"), "f_sid": data.get("fsid"),
+                      "bl": data.get("bl")}
+            tokens = {k: v for k, v in tokens.items() if v}
+            if wedged:
+                _close_tabs(wedged)
+            return tokens
+        wedged.append(tab.get("id"))
+    if wedged:
+        _close_tabs(wedged)
+    tab = _open_fresh_gemini_tab()
+    raw = _tab_evaluate(tab, _TOKEN_JS, _BRIDGE_EVAL_TIMEOUT)
+    if not (isinstance(raw, str) and raw.startswith("{")):
+        return {}
+    data = json.loads(raw)
+    return {"at": data.get("at"), "push_id": data.get("push"),
+            "pctx": data.get("pctx"), "f_sid": data.get("fsid"),
+            "bl": data.get("bl")}
+
+
+def fetch_page_tokens(force: bool = False) -> dict:
+    """Return cached-or-fresh Gemini page tokens from the CDP browser.
+
+    Args:
+        force: bypass the caches and read the live page once.
+
+    Returns:
+        Token dict (at/push_id/pctx/f_sid/bl subset). Empty dict when the
+        browser is unreachable or its tab is not logged in (no at); both
+        outcomes cool down for _BRIDGE_TOKEN_FAIL_TTL seconds.
+    """
+    if not vision_bridge_enabled():
+        return {}
+    with _bridge_token_lock:
+        now = time.monotonic()
+        if not force:
+            if (_bridge_token_state["tokens"]
+                    and now - _bridge_token_state["ts"] < _BRIDGE_TOKEN_TTL):
+                return dict(_bridge_token_state["tokens"])
+            if (not _bridge_token_state["tokens"]
+                    and now - _bridge_token_state["fail_ts"] < _BRIDGE_TOKEN_FAIL_TTL):
+                return {}
+        try:
+            tokens = _fetch_page_tokens_now()
+        except Exception as e:
+            log(f"bridge token fetch failed: {e}")
+            tokens = {}
+        if tokens.get("at"):
+            _bridge_token_state.update(tokens=tokens, ts=time.monotonic(),
+                                       fail_ts=0.0)
+        else:
+            _bridge_token_state.update(tokens=None, fail_ts=time.monotonic())
+        return dict(tokens)

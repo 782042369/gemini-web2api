@@ -6,6 +6,14 @@ semver.
 
 ## [Unreleased]
 
+### Vision direct-first hybrid with bridge token lending (2026-09-15)
+
+- New `vision_mode` config (`auto`/`bridge`/`direct`, default `auto`): image requests prefer the direct server-side chain (upload + StreamGenerate on the curl_cffi TLS session) whenever a live token set is available, and use the CDP bridge otherwise and as fallback on upload/generate failure (non-stream).
+- `vision_bridge.fetch_page_tokens()`: reads the live page tokens (`SNlM0e`/`qKIAYe`/`Ylro7b`/`FdrFJe`/`cfb2h`) from the CDP tab so the direct chain can borrow the browser-only XSRF token; wedge-tolerant (a hung tab is replaced by a freshly created one and closed), with success/failure cooldown caches.
+- Server-side page fetches omit `SNlM0e` for this DBSC-bound account (verified across six header/fingerprint variants): token merges now fill the gap from the bridge, and token-cache TTLs are tiered (complete 600s, `push_id`-only 120s, empty 30s).
+- Bridge path pre-flight: a logged-out or wedged tab now fails in milliseconds with `vision_bridge_not_logged_in` and a re-login hint instead of hanging for the full chain timeout (previously a 200s 502).
+- Incident context: the llq CDP Chrome had been wedged for days and silently lost its Google login, which took production vision down; the instance was restarted and requires a one-time manual re-login.
+
 ### Vision restored via CDP browser bridge (2026-09-10)
 
 - New `vision_bridge` module: image-bearing chat requests are executed inside a CDP-attached, logged-in Gemini tab (upload → ProcessFile with the live `at` token → StreamGenerate), the only environment the upstream still issues XSRF tokens to. Configured via `vision_bridge_url`; absent/None keeps the direct chain.

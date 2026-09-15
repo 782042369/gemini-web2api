@@ -77,13 +77,56 @@ def _get_page_tokens() -> dict:
             m = re.search(pattern, html)
             if m:
                 tokens[key] = m.group(1)
-        return tokens
+        return _merge_bridge_tokens(tokens)
     except RequestControlError:
         raise
     except Exception as e:
         check_budget("image session refresh")
         log(f"Page token fetch failed: {e}")
         return {}
+
+
+def _merge_bridge_tokens(tokens: dict) -> dict:
+    """Fill token gaps from the CDP browser when the page omits SNlM0e.
+
+    For this DBSC-bound account Google embeds the XSRF token (at) only in
+    pages served to the genuinely logged-in browser, so the server-side
+    fetch returns push_id/f_sid/bl but no at. When a vision bridge is
+    configured, borrow the live token set from the CDP tab (cached and
+    wedge-tolerant inside vision_bridge.fetch_page_tokens).
+
+    Args:
+        tokens: tokens scraped from the server-side page fetch.
+
+    Returns:
+        The merged dict; server-scraped values win, bridge fills gaps.
+    """
+    if not tokens.get("at"):
+        try:
+            from .vision_bridge import fetch_page_tokens
+            bridge = fetch_page_tokens()
+        except Exception as e:
+            log(f"bridge token fallback unavailable: {e}")
+            bridge = {}
+        for key, value in bridge.items():
+            if value and not tokens.get(key):
+                tokens[key] = value
+    return tokens
+
+
+def vision_direct_ready() -> bool:
+    """Report whether the direct chain can serve image requests right now.
+
+    Args:
+        None.
+
+    Returns:
+        True when the cached page tokens carry both the XSRF token (at)
+        and the upload push id - the minimum the direct upload+generate
+        chain needs to bind an uploaded reference to the account session.
+    """
+    tokens = _cached_page_tokens()
+    return bool(tokens.get("at") and tokens.get("push_id"))
 
 
 _page_tokens_cache = {}  # (cookie path, auth_user) -> tokens, freshness, lock
@@ -112,9 +155,16 @@ def _cached_page_tokens() -> dict:
             cookie_mtime = os.path.getmtime(path) if path != "__anonymous__" else 0.0
         except OSError:
             cookie_mtime = 0.0
-        # SNlM0e has been removed from the page upstream; push_id alone marks
-        # a usable token set (f_sid/bl ride along when present).
-        ttl = 600 if cache["tokens"].get("push_id") else 30
+        # TTL tiers: a complete set (at binds uploaded files to the
+        # session) lives 600s; push_id-only still serves text but retries
+        # sooner so a restored bridge login is picked up quickly; a total
+        # failure retries fast (bridge failures cool down separately).
+        if cache["tokens"].get("push_id") and cache["tokens"].get("at"):
+            ttl = 600
+        elif cache["tokens"].get("push_id"):
+            ttl = 120
+        else:
+            ttl = 30
         if cache["ts"] is not None and now - cache["ts"] < ttl and cache["mtime"] == cookie_mtime:
             return dict(cache["tokens"])
         tokens = _get_page_tokens()

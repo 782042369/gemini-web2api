@@ -9,6 +9,7 @@ from ..models import resolve_model
 from ..tools import messages_to_prompt, parse_tool_calls
 from ..upstream import generate, generate_stream
 from ..upstream.parser import extract_response_text
+from ..multimodal import vision_direct_ready
 from ..vision_bridge import vision_bridge_enabled, vision_generate
 from .images import _upload_images
 
@@ -16,6 +17,24 @@ from .images import _upload_images
 class OpenAIChatMixin:
     """Handler methods for the /v1/chat/completions endpoint."""
 
+
+    def _vision_mode(self) -> str:
+        """Resolve the effective vision routing mode.
+
+        Args:
+            None.
+
+        Returns:
+            One of "auto", "bridge" or "direct". Without a configured
+            bridge endpoint every mode degrades to "direct" (the bridge
+            legs are unreachable anyway).
+        """
+        mode = CONFIG.get("vision_mode") or "auto"
+        if mode not in ("auto", "bridge", "direct"):
+            mode = "auto"
+        if mode != "direct" and not vision_bridge_enabled():
+            return "direct"
+        return mode
 
     def _chat_via_vision_bridge(self, prompt, images, model_name, cid, stream):
         """Serve one image request through the CDP browser bridge.
@@ -30,6 +49,19 @@ class OpenAIChatMixin:
         Returns:
             None; writes one complete (or single-chunk SSE) response.
         """
+        # Pre-flight: a wedged or logged-out tab would otherwise hang the
+        # full chain timeout. Reading the page tokens is cheap and
+        # wedge-tolerant; no at means the browser needs a Google re-login.
+        try:
+            from ..vision_bridge import fetch_page_tokens
+            if not fetch_page_tokens().get("at"):
+                self._send_upstream_error(
+                    "vision bridge tab is not logged in (no SNlM0e in page) - "
+                    "re-login the Google account on the CDP browser desktop",
+                    code="vision_bridge_not_logged_in")
+                return
+        except Exception:
+            pass  # unreachable bridge: let the chain surface the real error
         try:
             sg_raw = vision_generate(prompt, images)
             text = extract_response_text(sg_raw)
@@ -99,17 +131,26 @@ class OpenAIChatMixin:
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-        # Vision bridge: image-bearing requests are executed inside the
-        # logged-in Gemini tab of the CDP browser (the only environment the
-        # upstream still hands a valid XSRF token to). Falls through to the
-        # direct chain when the bridge is not configured.
-        if images and vision_bridge_enabled():
+        # Vision routing (CONFIG["vision_mode"]): "bridge" always runs the
+        # chain inside the logged-in CDP tab; "auto" prefers the direct
+        # chain whenever a live token set (at + push_id, borrowed from the
+        # CDP page when needed) is available and uses the bridge otherwise
+        # and as an upload-failure fallback; "direct" never uses the bridge.
+        mode = self._vision_mode()
+        if images and mode == "bridge":
+            self._chat_via_vision_bridge(prompt, images, model_name, cid, stream)
+            return
+        if images and mode == "auto" and not vision_direct_ready():
             self._chat_via_vision_bridge(prompt, images, model_name, cid, stream)
             return
 
         try:
             file_refs = _upload_images(images)
         except RuntimeError as e:
+            if images and mode == "auto":
+                log(f"direct vision upload failed ({e}); falling back to CDP bridge")
+                self._chat_via_vision_bridge(prompt, images, model_name, cid, stream)
+                return
             self._send_upstream_error(e, code="image_upload_failed")
             return
 
@@ -155,6 +196,13 @@ class OpenAIChatMixin:
         try:
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
+            # Non-stream requests can still be rescued through the CDP
+            # bridge when the direct generation rejects the attachment.
+            if images and mode == "auto":
+                log(f"direct vision generate failed ({type(e).__name__}: {e}); "
+                    "falling back to CDP bridge")
+                self._chat_via_vision_bridge(prompt, images, model_name, cid, stream)
+                return
             self._send_upstream_error(e, code="upstream_error")
             return
 

@@ -41,6 +41,11 @@ DEFAULT_CONFIG = {
     # 20260908-vision.md). Image-bearing requests are executed inside that
     # tab. None/empty disables the bridge and keeps the direct chain.
     "vision_bridge_url": None,
+    # Vision routing: "auto" = direct chain first whenever a live token set
+    # (at + push_id; borrowed from the bridge tab when the server-side page
+    # omits SNlM0e) is available, CDP bridge otherwise and as fallback;
+    # "bridge" = always the CDP tab; "direct" = never use the bridge.
+    "vision_mode": "auto",
     # Transparent micro-batching of short single-segment generateContent
     # requests (companion plugins firing burst translations). 0 disables.
     # Active session keepalive: rotate PSIDTS + refresh SNlM0e every N
@@ -77,7 +82,7 @@ _TYPED_KEYS = {
     "microbatch_sec": "float", "microbatch_single_sec": "float",
     "microbatch_max": "int", "microbatch_max_prompt": "int",
     "host": "str", "gemini_bl": "str", "default_model": "str",
-    "impersonate": "str",
+    "impersonate": "str", "vision_mode": "str",
     "log_file": "str", "log_retention_days": "int",
     "max_request_body_bytes": "int", "max_image_bytes": "int",
     "request_body_timeout_sec": "int", "allow_private_image_urls": "bool",
@@ -135,6 +140,9 @@ def validate_config(cfg: dict = None) -> list:
                 valid = False
             if not valid:
                 problems.append(f"{key}: must be positive and finite; safe default will be used")
+    vision_mode = cfg.get("vision_mode")
+    if vision_mode is not None and vision_mode not in ("auto", "bridge", "direct"):
+        problems.append(f"vision_mode: expected auto/bridge/direct, got {vision_mode!r}")
     for key in cfg:
         if key not in DEFAULT_CONFIG:
             problems.append(f"unknown key (typo?): {key}")
