@@ -213,15 +213,13 @@ def vision_generate(prompt: str, images: list) -> str:
     if oversized:
         raise VisionBridgeError(
             f"image exceeds bridge limit of {MAX_BRIDGE_IMAGE_BYTES} bytes")
-    tab = _find_gemini_tab()
-    import websocket  # from requirements: websocket-client
-    _, host, port = _bridge_endpoint()
-    ws_url = tab["webSocketDebuggerUrl"]
-    # Rewrite the loopback host Chrome reports to the bridge endpoint.
-    from urllib.parse import urlparse
-    wp = urlparse(ws_url)
-    ws_url = ws_url.replace(f"{wp.hostname}:{wp.port or 9222}", f"{host}:{port}", 1)
-    ws = websocket.create_connection(ws_url, timeout=200, suppress_origin=True)
+    try:
+        tab = _find_gemini_tab()
+    except VisionBridgeError:
+        # No Gemini tab (e.g. after a browser restart): open a fresh one
+        # instead of failing - the chain itself reports missing logins.
+        tab = _open_fresh_gemini_tab()
+    ws = _tab_ws(tab, 200)
     try:
         js = _page_chain_js(prompt, images)
         ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
@@ -408,7 +406,7 @@ def _open_fresh_gemini_tab() -> dict:
     for tab in _cdp_http("/json/list"):
         if tab.get("id") == target_id and tab.get("type") == "page":
             _tab_evaluate(tab,
-                          "location.href !== 'https://gemini.google.com/app'"
+                          "location.href.indexOf('gemini.google.com') < 0"
                           " && location.assign('https://gemini.google.com/app')",
                           _BRIDGE_EVAL_TIMEOUT)
             break
@@ -421,6 +419,25 @@ def _open_fresh_gemini_tab() -> dict:
                 return tab
         time.sleep(1)
     raise VisionBridgeError("fresh Gemini tab did not navigate")
+
+
+def _map_page_tokens(raw) -> dict:
+    """Validate and map one _TOKEN_JS evaluate result to token names.
+
+    Args:
+        raw: Runtime.evaluate return value (expected JSON string).
+
+    Returns:
+        Mapped dict with truthy at/push_id/pctx/f_sid/bl values only;
+        empty dict when raw is not a JSON object string.
+    """
+    if not (isinstance(raw, str) and raw.startswith("{")):
+        return {}
+    data = json.loads(raw)
+    tokens = {"at": data.get("at"), "push_id": data.get("push"),
+              "pctx": data.get("pctx"), "f_sid": data.get("fsid"),
+              "bl": data.get("bl")}
+    return {k: v for k, v in tokens.items() if v}
 
 
 def _fetch_page_tokens_now() -> dict:
@@ -443,26 +460,16 @@ def _fetch_page_tokens_now() -> dict:
         except Exception:
             wedged.append(tab.get("id"))
             continue
-        if isinstance(raw, str) and raw.startswith("{"):
-            data = json.loads(raw)
-            tokens = {"at": data.get("at"), "push_id": data.get("push"),
-                      "pctx": data.get("pctx"), "f_sid": data.get("fsid"),
-                      "bl": data.get("bl")}
-            tokens = {k: v for k, v in tokens.items() if v}
+        tokens = _map_page_tokens(raw)
+        if tokens:
             if wedged:
                 _close_tabs(wedged)
             return tokens
         wedged.append(tab.get("id"))
     if wedged:
         _close_tabs(wedged)
-    tab = _open_fresh_gemini_tab()
-    raw = _tab_evaluate(tab, _TOKEN_JS, _BRIDGE_EVAL_TIMEOUT)
-    if not (isinstance(raw, str) and raw.startswith("{")):
-        return {}
-    data = json.loads(raw)
-    return {"at": data.get("at"), "push_id": data.get("push"),
-            "pctx": data.get("pctx"), "f_sid": data.get("fsid"),
-            "bl": data.get("bl")}
+    return _map_page_tokens(
+        _tab_evaluate(_open_fresh_gemini_tab(), _TOKEN_JS, _BRIDGE_EVAL_TIMEOUT))
 
 
 def fetch_page_tokens(force: bool = False) -> dict:

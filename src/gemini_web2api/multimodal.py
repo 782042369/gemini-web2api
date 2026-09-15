@@ -20,11 +20,13 @@ def _get_page_tokens() -> dict:
     """Fetch WIZ_global_data tokens from the Gemini app page.
 
     Returns:
-        dict with "push_id" (qKIAYe), "pctx" (Ylro7b) and "at" (SNlM0e)
-        when present; {} on failure. The push_id binds uploads to the
-        signed-in account's storage bucket - without it an upload would
-        land in the anonymous bucket whose references StreamGenerate
-        rejects with BardErrorInfo 1100.
+        dict with "push_id" (qKIAYe), "pctx" (Ylro7b), "f_sid" (FdrFJe),
+        "bl" (cfb2h) and "at" (SNlM0e) when present; gaps (notably at,
+        withheld from server-fetched pages for this DBSC-bound account)
+        are filled from the vision bridge when configured; {} on failure.
+        The push_id binds uploads to the signed-in account's storage
+        bucket - without it an upload would land in the anonymous bucket
+        whose references StreamGenerate rejects with BardErrorInfo 1100.
     """
     check_budget("image session refresh")
     auth_user = _active_auth_user()
@@ -140,9 +142,11 @@ def _cached_page_tokens() -> dict:
         None; account context is bound to the current request thread.
 
     Returns:
-        Tokens for the selected account. Complete upload tokens are cached for
-        600 seconds, failed/incomplete fetches for only 30 seconds. A cookie-file
-        change invalidates the entry immediately.
+        Tokens for the selected account. Complete token sets (at + push_id)
+        are cached for 600 seconds, push_id-only sets for 120 (text traffic
+        keeps working; a restored bridge login is picked up quickly) and
+        empty/failed fetches for 30 seconds. A cookie-file change
+        invalidates the entry immediately.
     """
     path = _active_cookie_path() or "__anonymous__"
     key = (path, _active_auth_user())

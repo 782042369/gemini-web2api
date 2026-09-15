@@ -10,7 +10,7 @@ from ..tools import messages_to_prompt, parse_tool_calls
 from ..upstream import generate, generate_stream
 from ..upstream.parser import extract_response_text
 from ..multimodal import vision_direct_ready
-from ..vision_bridge import vision_bridge_enabled, vision_generate
+from ..vision_bridge import fetch_page_tokens, vision_bridge_enabled, vision_generate
 from .images import _upload_images
 
 
@@ -53,7 +53,6 @@ class OpenAIChatMixin:
         # full chain timeout. Reading the page tokens is cheap and
         # wedge-tolerant; no at means the browser needs a Google re-login.
         try:
-            from ..vision_bridge import fetch_page_tokens
             if not fetch_page_tokens().get("at"):
                 self._send_upstream_error(
                     "vision bridge tab is not logged in (no SNlM0e in page) - "
