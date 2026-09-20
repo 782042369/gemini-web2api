@@ -5,8 +5,7 @@ import threading
 import unittest
 from unittest import mock
 
-from gemini_web2api.budget import (RequestDeadlineExceeded, QueueTimeout,
-                                  QueueFull, current_budget)
+from gemini_web2api.budget import QueueFull, QueueTimeout, RequestDeadlineExceeded, current_budget
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 
@@ -73,7 +72,7 @@ class HTTPBudgetTests(unittest.TestCase):
         def upload(images):
             """Consume simulated time. Args: parsed images. Returns: no references."""
             clock[0] += 6
-            return None
+            return
 
         cases = [
             ("openai_chat", "/v1/chat/completions", {"messages": [{"content": "hi"}], "stream": True}),
@@ -114,7 +113,7 @@ class HTTPBudgetTests(unittest.TestCase):
         def upload(images):
             """Capture the HTTP budget. Args: images. Returns: None."""
             seen.append(current_budget())
-            return None
+            return
 
         def generate(*args):
             """Capture the same HTTP budget. Args: ignored. Returns: translation."""

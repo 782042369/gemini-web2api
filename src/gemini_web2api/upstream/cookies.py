@@ -7,7 +7,6 @@ from contextlib import contextmanager
 from ..config import CONFIG
 from ..logs import log
 
-
 # Cookie pool: multiple Google accounts (cookie files) rotated per request.
 _cookie_caches = {}                 # path -> {"str", "sapisid", "auth_user", "mtime"}
 _active_cookie = threading.local()  # per-request selected cookie slot
@@ -126,7 +125,7 @@ def _cookie_paths() -> list:
         Pool entries followed by the legacy cookie file when configured.
     """
     paths = []
-    for p in list(CONFIG.get("cookie_files") or []) + [CONFIG.get("cookie_file")]:
+    for p in [*(CONFIG.get("cookie_files") or []), CONFIG.get("cookie_file")]:
         if p and p not in paths:
             paths.append(p)
     return paths
@@ -223,7 +222,7 @@ def load_cookie() -> tuple:
                 return "", None
             mtime = os.path.getmtime(cookie_file)
             if not cache or mtime != cache.get("mtime"):
-                with open(cookie_file, "r", encoding="utf-8") as f:
+                with open(cookie_file, encoding="utf-8") as f:
                     content = f.read().strip()
                 data = json.loads(content) if content.startswith("{") else {"cookie": content}
                 cookie_str = data.get("cookie", "")

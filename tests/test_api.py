@@ -1,5 +1,5 @@
-import http.client
 import base64
+import http.client
 import json
 import threading
 import unittest
@@ -7,10 +7,10 @@ from unittest import mock
 from urllib.parse import parse_qs
 
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
-from gemini_web2api.upstream.parser import extract_conversation_id
-from gemini_web2api.upstream.protocol import _build_payload
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
+from gemini_web2api.upstream.parser import extract_conversation_id
+from gemini_web2api.upstream.protocol import _build_payload
 
 
 def _decode_payload(payload):

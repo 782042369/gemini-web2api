@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest import mock
 from urllib.parse import parse_qs
 
-from gemini_web2api.batching import _MicroBatcher, _microbatch_runner
+from gemini_web2api.batching import _microbatch_runner, _MicroBatcher
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api.server.google import GoogleGenerateMixin
 from gemini_web2api.server.images import _upload_images

@@ -10,27 +10,32 @@ import re
 import time
 import uuid
 from contextlib import contextmanager
-from urllib.parse import parse_qs, urlsplit
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
+from urllib.parse import parse_qs, urlsplit
 
 from .. import __version__
-from ..config import CONFIG
 from ..budget import RequestBudget, RequestControlError, budget_scope, check_budget, remaining_timeout
+from ..config import CONFIG
 from ..logs import get_request_id, log, set_request_id
 from ..models import MODELS
 from ..upstream import pick_next_cookie
-from ..validation import (RequestValidationError, validate_chat_request,
-                          validate_responses_request, validate_google_request)
+from ..validation import (
+    RequestValidationError,
+    validate_chat_request,
+    validate_google_request,
+    validate_responses_request,
+)
 from .google import GoogleGenerateMixin
 from .openai_chat import OpenAIChatMixin
 from .openai_responses import OpenAIResponsesMixin
-
 from .request_body import RequestBodyError, read_request_body
 from .writer import BudgetWriter
 
 
 class BaseAPIHandler(BaseHTTPRequestHandler):
+    """Shared HTTP handler: routing, auth, budgets, logging for all mixins."""
+
     # HTTP/1.1 keep-alive so clients (browser extensions, proxies) reuse TCP
     # connections instead of paying a handshake per request. SSE responses
     # opt out via "Connection: close" (no Content-Length can be known).
@@ -55,6 +60,7 @@ class BaseAPIHandler(BaseHTTPRequestHandler):
             self._terminal_delivery = previous
 
     def log_message(self, fmt, *args):
+        """Silence the default stderr access log. Args: fmt, args. Returns: None."""
         # POST access lines are emitted at request end by do_POST (with
         # duration, status and request id); suppress the start-of-request
         # default line to avoid duplicates.
@@ -181,7 +187,7 @@ class BaseAPIHandler(BaseHTTPRequestHandler):
         """
         encoded = json.dumps(payload, ensure_ascii=False)
         prefix = f"event: {event}\n" if event else ""
-        self.wfile.write(f"{prefix}data: {encoded}\n\n".encode("utf-8"))
+        self.wfile.write(f"{prefix}data: {encoded}\n\n".encode())
         self.wfile.flush()
 
     def _write_stream_error(self, protocol, message="stream failed", error=None):
@@ -283,6 +289,7 @@ class BaseAPIHandler(BaseHTTPRequestHandler):
         return any(value in keys for value in query.get("key", []))
 
     def do_OPTIONS(self):
+        """Answer CORS preflights. Args: None. Returns: None."""
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -292,6 +299,7 @@ class BaseAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_HEAD(self):
+        """Serve HEAD health probes. Args: None. Returns: None."""
         # HEAD-based monitors must see 2xx, not 501 Not Implemented.
         path = self.path.split("?", 1)[0]
         self.send_response(200 if path == "/" else 404)
@@ -299,6 +307,7 @@ class BaseAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        """Serve models/health GET endpoints. Args: None. Returns: None."""
         try:
             # Strip query strings before routing: monitors often append
             # cache-busters (/?t=123) which broke exact-match paths.
@@ -327,6 +336,7 @@ class BaseAPIHandler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
+        """Route API POST bodies to the protocol mixins. Args: None. Returns: None."""
         t_start = self._begin_request()
         request_budget = RequestBudget()
         try:

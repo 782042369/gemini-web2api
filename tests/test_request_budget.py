@@ -8,8 +8,15 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest import mock
 
-from gemini_web2api.budget import (RequestBudget, RequestCancelled, RequestDeadlineExceeded,
-                                  QueueFull, QueueTimeout, budget_scope, current_budget)
+from gemini_web2api.budget import (
+    QueueFull,
+    QueueTimeout,
+    RequestBudget,
+    RequestCancelled,
+    RequestDeadlineExceeded,
+    budget_scope,
+    current_budget,
+)
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api.upstream import concurrency
 from gemini_web2api.upstream.retry import UpstreamRejection

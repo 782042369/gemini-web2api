@@ -7,14 +7,21 @@ into numbered segments. Both fall back to direct calls per dropped segment.
 import threading
 import time
 
+from .budget import (
+    QueueFull,
+    QueueTimeout,
+    RequestBudget,
+    RequestControlError,
+    budget_scope,
+    check_budget,
+    positive_seconds,
+)
 from .config import CONFIG
-from .budget import (RequestBudget, RequestControlError, QueueTimeout, QueueFull, budget_scope,
-                     check_budget, positive_seconds)
 from .logs import get_request_id, log
-from .upstream import generate
-from .upstream.cookies import _active_auth_user, _active_cookie_path, set_active_auth_user, use_cookie
 from .translation import parse_numbered_translations, require_translation, split_translation_batches
+from .upstream import generate
 from .upstream.concurrency import max_queued_requests
+from .upstream.cookies import _active_auth_user, _active_cookie_path, set_active_auth_user, use_cookie
 
 
 class _MicroBatcher:
@@ -182,7 +189,8 @@ class _MicroBatcher:
             log(f"Microbatch dispatch: {len(prompts)} segment(s){suffix}")
             budgets = [entry["budget"] for entry in entries if entry.get("budget") is not None]
             shared = RequestBudget(deadline=max(b.deadline for b in budgets),
-                                   cancel_check=lambda: all(not b.is_active() for b in budgets)) if budgets else RequestBudget()
+                                   cancel_check=lambda budgets=budgets: all(
+                                       not b.is_active() for b in budgets)) if budgets else RequestBudget()
             for entry in entries:
                 if entry["holder"].get("started") is not None:
                     entry["holder"]["started"].set()
@@ -257,9 +265,8 @@ def _microbatch_eligible(req) -> tuple:
         p.get("text", "") for p in (sys_inst.get("parts") or []) if isinstance(p, dict)
     ).strip()
     contents = req.get("contents")
-    if reason is None:
-        if not isinstance(contents, list) or len(contents) != 1:
-            reason = f"contents={len(contents) if isinstance(contents, list) else 'x'}"
+    if reason is None and (not isinstance(contents, list) or len(contents) != 1):
+        reason = f"contents={len(contents) if isinstance(contents, list) else 'x'}"
     if reason is None:
         content = contents[0] or {}
         if content.get("role") not in (None, "user"):
@@ -331,7 +338,7 @@ def _microbatch_runner(model_id, think_mode, extra_fields, instruction=""):
             raise
         results = []
         for i, prompt in enumerate(prompts):
-            if i in parsed and parsed[i]:
+            if parsed.get(i):
                 results.append(parsed[i])
             else:
                 results.append(_direct(prompt))

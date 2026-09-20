@@ -6,21 +6,33 @@ import threading
 import time
 import uuid
 
+from ..budget import (
+    RequestBudget,
+    RequestCancelled,
+    RequestControlError,
+    RequestDeadlineExceeded,
+    budget_scope,
+    check_budget,
+    current_budget,
+    positive_seconds,
+    remaining_timeout,
+)
 from ..config import CONFIG
-from ..budget import (RequestBudget, RequestControlError, RequestCancelled, RequestDeadlineExceeded,
-                      budget_scope, check_budget, current_budget,
-                      positive_seconds, remaining_timeout)
 from ..logs import log
 from .concurrency import _UpstreamSlot
 from .cookies import _active_auth_user, _active_cookie_path, pick_next_cookie
 from .history import schedule_history_delete
-from .parser import (_extract_conversation_id, _extract_texts_from_line, clean_text,
-                     extract_conversation_id, extract_response_text)
+from .parser import (
+    _extract_conversation_id,
+    _extract_texts_from_line,
+    clean_text,
+    extract_conversation_id,
+    extract_response_text,
+)
+from .protocol import _build_headers, _build_payload, _get_url
 from .retry import EmptyUpstreamResponse, UpstreamRejection, retry_decision
 from .retry import _retry_delay as _retry_delay  # backward-compatible import path
-from .protocol import _build_headers, _build_payload, _get_url
-from .transport import (HAS_HTTPX, _get_httpx_client, _urllib_post,
-                        curl_total_timeout, get_browser_session)
+from .transport import HAS_HTTPX, _get_httpx_client, _urllib_post, curl_total_timeout, get_browser_session
 
 try:
     import httpx
@@ -271,6 +283,7 @@ def _generate_upstream(prompt, model_id, think_mode, file_refs=None, extra_field
                     continue
                 if not _retry(exc, attempt, attempts):
                     raise
+        raise UpstreamRejection("generation exhausted all attempts")  # defensive
 
 
 def generate_stream(prompt, model_id, think_mode, file_refs=None, extra_fields=None):

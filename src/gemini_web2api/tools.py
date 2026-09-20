@@ -1,10 +1,11 @@
 """Tool calling and multimodal message parsing."""
-import json
-import re
-import uuid
 import base64
 import binascii
 import io
+import json
+import re
+import uuid
+from typing import Optional
 from urllib.parse import unquote_to_bytes
 
 MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
@@ -26,8 +27,7 @@ def _compress_b64_if_needed(b64: str) -> str:
         # Convert to JPEG with quality reduction
         buf = io.BytesIO()
         img.convert("RGB").save(buf, format="JPEG", quality=60)
-        compressed = base64.b64encode(buf.getvalue()).decode()
-        return compressed
+        return base64.b64encode(buf.getvalue()).decode()
     except Exception:
         # If PIL not available, truncate (model will get partial data)
         return b64[:MAX_IMAGE_B64_SIZE]
@@ -54,6 +54,14 @@ def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
 
 
 def _decode_data_url(url: str):
+    """Decode a data: URL into raw bytes and its MIME type.
+
+    Args:
+        url: data URL string, optionally base64 encoded.
+
+    Returns:
+        (bytes, mime) tuple, or None when malformed.
+    """
     match = re.match(r"^data:([^;,]+)?(;base64)?,(.*)$", url, re.DOTALL)
     if not match:
         return None
@@ -68,7 +76,16 @@ def _decode_data_url(url: str):
         return None
 
 
-def _image_from_url(url: str, mime: str = None):
+def _image_from_url(url: str, mime: Optional[str] = None):
+    """Normalize an image source to (fetchable source, mime).
+
+    Args:
+        url: data: URL or http(s) link.
+        mime: caller-supplied MIME fallback.
+
+    Returns:
+        Tuple ready for image fetching, or None when unusable.
+    """
     if not isinstance(url, str) or not url:
         return None
     if url.startswith("data:"):
@@ -77,6 +94,14 @@ def _image_from_url(url: str, mime: str = None):
 
 
 def _image_from_part(part: dict):
+    """Extract an image source from one chat content part.
+
+    Args:
+        part: OpenAI-style content part dict.
+
+    Returns:
+        Normalized image tuple (see _image_from_url), or None.
+    """
     part_type = part.get("type")
     if part_type == "image_url":
         image_url = part.get("image_url", {})
@@ -101,7 +126,7 @@ def _image_from_part(part: dict):
     return None
 
 
-def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
+def messages_to_prompt(messages: list, tools: Optional[list] = None, tool_choice=None) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list).
 
     Returns (prompt, images) where images is a list of (bytes, mime_type) tuples.

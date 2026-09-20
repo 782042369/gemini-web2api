@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sys
+from typing import Optional
 
 DEFAULT_CONFIG = {
     "port": 8081,
@@ -106,7 +107,7 @@ def _warn(msg: str) -> None:
     sys.stderr.write(f"[config] {msg}\n")
 
 
-def validate_config(cfg: dict = None) -> list:
+def validate_config(cfg: Optional[dict] = None) -> list:
     """Validate a config dict against known keys and expected types.
 
     Args:
@@ -149,7 +150,7 @@ def validate_config(cfg: dict = None) -> list:
     return problems
 
 
-def load_config(path: str = None):
+def load_config(path: Optional[str] = None):
     """Load config from a JSON file into the live CONFIG dict.
 
     Args:

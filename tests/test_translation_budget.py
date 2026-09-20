@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from gemini_web2api.batching import _MicroBatcher, _microbatch_runner
+from gemini_web2api.batching import _microbatch_runner, _MicroBatcher
 from gemini_web2api.budget import RequestBudget, RequestDeadlineExceeded, budget_scope
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api.server.google import GoogleGenerateMixin

@@ -35,8 +35,8 @@ from contextlib import contextmanager
 from typing import NamedTuple
 from urllib.parse import quote, urlsplit
 
-from .config import CONFIG
 from .budget import RequestControlError, check_budget, remaining_timeout
+from .config import CONFIG
 from .logs import log
 
 _DEFAULT_MAX_BYTES = 20 * 1024 * 1024

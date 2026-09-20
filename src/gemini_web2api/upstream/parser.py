@@ -6,6 +6,15 @@ from .retry import UpstreamRejection
 
 
 def clean_text(text: str, strip: bool = True) -> str:
+    """Strip upstream scaffolding artifacts from a response text.
+
+    Args:
+        text: raw candidate text from the protocol parser.
+        strip: also trim surrounding whitespace when True.
+
+    Returns:
+        Cleaned text.
+    """
     text = re.sub(
         r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
         '', text, flags=re.DOTALL

@@ -298,8 +298,9 @@ def _tab_ws(tab: dict, timeout: float):
     Raises:
         VisionBridgeError: when the connection cannot be established.
     """
-    import websocket
     from urllib.parse import urlparse
+
+    import websocket
     _, host, port = _bridge_endpoint()
     ws_url = tab["webSocketDebuggerUrl"]
     wp = urlparse(ws_url)

@@ -9,12 +9,10 @@ internal module layout:
     extract_response_text / extract_conversation_id    - response parsing
     transport selection (HAS_HTTPX / HAS_CURL_CFFI / get_browser_session)
 """
-from .cookies import (_active_cookie_path, _cookie_caches, load_cookie,
-                      pick_next_cookie)
+from .cookies import _active_cookie_path, _cookie_caches, load_cookie, pick_next_cookie
 from .generate import generate, generate_stream, start_keep_warm
 from .history import delete_conversation, schedule_history_delete
-from .parser import (clean_text, extract_conversation_id,
-                     extract_response_text)
+from .parser import clean_text, extract_conversation_id, extract_response_text
 from .protocol import _build_headers, _build_payload, make_sapisidhash
 from .transport import CHROME_UA, HAS_CURL_CFFI, HAS_HTTPX, get_browser_session
 

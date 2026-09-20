@@ -6,10 +6,10 @@ import uuid
 from ..config import CONFIG
 from ..logs import log
 from ..models import resolve_model
+from ..multimodal import vision_direct_ready
 from ..tools import messages_to_prompt, parse_tool_calls
 from ..upstream import generate, generate_stream
 from ..upstream.parser import extract_response_text
-from ..multimodal import vision_direct_ready
 from ..vision_bridge import fetch_page_tokens, vision_bridge_enabled, vision_generate
 from .images import _upload_images
 

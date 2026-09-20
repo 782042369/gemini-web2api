@@ -4,6 +4,7 @@ import json
 import time
 import urllib.parse
 import uuid
+from typing import Optional
 
 from ..config import CONFIG
 from .cookies import _active_auth_user, get_active_xsrf_token, load_cookie
@@ -39,7 +40,7 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
-def _build_headers(uuid_val: str = None) -> dict:
+def _build_headers(uuid_val: Optional[str] = None) -> dict:
     """Build request headers for StreamGenerate.
 
     Args:
@@ -94,7 +95,7 @@ def _apply_chat_persistence_flags(inner: list) -> None:
         inner[41] = [2]
 
 
-def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, uuid_val: str = None) -> str:
+def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: Optional[list] = None, extra_fields: Optional[dict] = None, uuid_val: Optional[str] = None) -> str:
     """Build the urlencoded f.req payload for StreamGenerate.
 
     Args:

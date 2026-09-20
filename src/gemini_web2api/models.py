@@ -1,5 +1,7 @@
 """Model definitions and mapping from Gemini frontend JS source."""
 
+from typing import Optional
+
 from .config import CONFIG
 
 # MODE_CATEGORY enum from 028-6eb337387583.js:
@@ -57,7 +59,7 @@ MODELS = {
 }
 
 
-def resolve_model(model_name: str, default: str = None):
+def resolve_model(model_name: str, default: Optional[str] = None):
     """Resolve model name to (name, mode_id, think_mode, error, extra_fields).
 
     Unknown model names fall back to default rather than erroring,

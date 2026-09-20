@@ -2,18 +2,23 @@
 import json
 import threading
 import urllib.parse
+from typing import Optional
 
 from ..config import CONFIG
 from ..logs import log
 from .cookies import (
-    _active_auth_user, _active_cookie_path, restore_active_cookie,
-    get_active_xsrf_token, set_active_auth_user, set_active_cookie,
+    _active_auth_user,
+    _active_cookie_path,
+    get_active_xsrf_token,
+    restore_active_cookie,
+    set_active_auth_user,
+    set_active_cookie,
 )
 from .protocol import _build_headers, _delete_url
 from .transport import HAS_HTTPX, _get_httpx_client, _urllib_post
 
 
-def delete_conversation(cid: str, cookie_path: str = None, auth_user=None) -> bool:
+def delete_conversation(cid: str, cookie_path: Optional[str] = None, auth_user=None) -> bool:
     """EXPERIMENTAL: best-effort delete of a conversation from account history.
 
     Upstream rejects the hNktQb batchexecute call on current builds (XSRF

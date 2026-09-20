@@ -11,8 +11,12 @@ import unittest
 from unittest import mock
 from urllib.parse import parse_qs
 
-from gemini_web2api.batching import (_MicroBatcher, _extract_batch_segments,
-                                     _microbatch_eligible, _microbatch_runner)
+from gemini_web2api.batching import (
+    _extract_batch_segments,
+    _microbatch_eligible,
+    _microbatch_runner,
+    _MicroBatcher,
+)
 from gemini_web2api.config import CONFIG
 from gemini_web2api.models import resolve_model
 from gemini_web2api.upstream import cookies as cookies_mod
@@ -289,7 +293,7 @@ class ModelResolutionTests(unittest.TestCase):
         self.assertEqual(think, 4)
 
     def test_think_suffix_overrides(self):
-        name, mode, think, err, extra = resolve_model("gemini-3.8-flash@think=0")
+        name, _mode, think, err, _extra = resolve_model("gemini-3.8-flash@think=0")
         self.assertEqual((name, err), ("gemini-3.8-flash", None))
         self.assertEqual(think, 0)
 

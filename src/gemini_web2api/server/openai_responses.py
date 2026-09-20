@@ -3,10 +3,10 @@ import json
 import time
 import uuid
 
-from ..config import CONFIG
 from ..budget import RequestControlError
-from ..models import resolve_model
+from ..config import CONFIG
 from ..logs import log
+from ..models import resolve_model
 from ..tools import messages_to_prompt, parse_tool_calls
 from ..upstream import generate, generate_stream
 from .images import _upload_images
@@ -217,6 +217,7 @@ class OpenAIResponsesMixin:
             sequence_number = 0
 
             def emit(event_type, **fields):
+                """Write one numbered Responses SSE event. Args: event fields. Returns: None."""
                 nonlocal sequence_number
                 sequence_number += 1
                 event = {

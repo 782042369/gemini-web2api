@@ -3,16 +3,15 @@ import json
 import re
 import time
 
-from ..batching import (_MICROBATCHER, _extract_batch_segments,
-                        _microbatch_eligible, _microbatch_runner)
+from ..batching import _MICROBATCHER, _extract_batch_segments, _microbatch_eligible, _microbatch_runner
+from ..budget import RequestControlError, check_budget
 from ..config import CONFIG
 from ..logs import log
 from ..models import resolve_model
-from ..translation import parse_numbered_translations, require_translation, split_translation_batches
-from ..budget import RequestControlError, check_budget
-from ..upstream.retry import retry_decision
 from ..tools import google_contents_to_prompt, parse_google_function_calls
+from ..translation import parse_numbered_translations, require_translation, split_translation_batches
 from ..upstream import generate, generate_stream
+from ..upstream.retry import retry_decision
 from .images import _upload_images
 
 

@@ -10,7 +10,6 @@ import urllib.request
 from contextlib import contextmanager
 
 from ..budget import check_budget, remaining_timeout
-
 from ..config import CONFIG
 
 try:
@@ -37,6 +36,7 @@ CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 
 def _get_ssl_ctx():
+    """Lazily build the shared default SSL context. Args: None. Returns: ssl context."""
     global _ssl_ctx
     if _ssl_ctx is None:
         _ssl_ctx = ssl.create_default_context()
@@ -44,6 +44,7 @@ def _get_ssl_ctx():
 
 
 def _get_httpx_client():
+    """Lazily build the pooled httpx fallback client. Args: None. Returns: client or None."""
     global _httpx_client
     if _httpx_client is None and HAS_HTTPX:
         proxy = CONFIG.get("proxy")

@@ -1,19 +1,24 @@
 """Multimodal: browser-aligned two-step Scotty resumable upload."""
 import os
-import urllib.request
-import urllib.parse
-import time
 import re
 import threading
+import time
+import urllib.parse
+import urllib.request
 
-from .config import CONFIG
 from .budget import RequestControlError, budget_lock, check_budget, remaining_timeout
+from .config import CONFIG
 from .image_fetch import fetch_image_bytes as fetch_image_bytes
 from .logs import log
 from .upstream.cookies import _active_auth_user, _active_cookie_path, load_cookie
 from .upstream.protocol import make_sapisidhash
-from .upstream.transport import (CHROME_UA, _get_ssl_ctx, get_browser_session,
-                                 curl_total_timeout, read_urllib_response)
+from .upstream.transport import (
+    CHROME_UA,
+    _get_ssl_ctx,
+    curl_total_timeout,
+    get_browser_session,
+    read_urllib_response,
+)
 
 
 def _get_page_tokens() -> dict:

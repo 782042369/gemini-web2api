@@ -13,19 +13,26 @@ import threading
 import time
 import urllib.request
 
-from .config import CONFIG
 from .budget import RequestControlError
+from .config import CONFIG
 from .logs import log
 from .upstream import generate
 from .upstream.cookies import (
-    _account_state, _account_state_lock, _active_cookie_path,
-    _cookie_paths, _cookie_caches,
+    _account_state,
+    _account_state_lock,
+    _active_cookie_path,
+    _cookie_caches,
+    _cookie_paths,
+    get_active_xsrf_token,
+    load_cookie,
+    restore_active_cookie,
+    set_active_cookie,
+    set_active_xsrf_token,
+)
+from .upstream.cookies import (
     _cookie_lock as _cookie_write_lock,
-    get_active_xsrf_token, load_cookie, set_active_cookie,
-    set_active_xsrf_token, restore_active_cookie,
 )
 from .upstream.transport import CHROME_UA, _get_ssl_ctx, get_browser_session
-
 
 _last_cookie_persist = {}  # cookie path -> last disk persistence timestamp
 
@@ -116,7 +123,7 @@ def _persist_cookie_file(cookie_file: str, cookie_str: str, sapisid, auth_user,
         try:
             data = {}
             if os.path.exists(cookie_file):
-                with open(cookie_file, "r", encoding="utf-8") as f:
+                with open(cookie_file, encoding="utf-8") as f:
                     content = f.read().strip()
                 if content.startswith("{"):
                     data = json.loads(content)
@@ -320,7 +327,7 @@ def _rotate_psidts_active() -> bool:
     rotate_cookie = cookie_str
     try:
         with _cookie_write_lock:
-            with open(cookie_file, "r", encoding="utf-8") as f:
+            with open(cookie_file, encoding="utf-8") as f:
                 content = f.read().strip()
             if content.startswith("{"):
                 acct = json.loads(content).get("accounts_cookie") or ""
@@ -387,7 +394,7 @@ def _sync_accounts_cookie(resp) -> None:
     with _cookie_write_lock:
         try:
             load_cookie()
-            with open(cookie_file, "r", encoding="utf-8") as f:
+            with open(cookie_file, encoding="utf-8") as f:
                 content = f.read().strip()
             if not content.startswith("{"):
                 return

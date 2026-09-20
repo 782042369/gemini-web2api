@@ -2,11 +2,10 @@
 import threading
 import time
 
+from ..budget import QueueFull, QueueTimeout, RequestBudget, current_budget, positive_seconds
 from ..config import CONFIG
-from ..budget import RequestBudget, QueueFull, QueueTimeout, current_budget, positive_seconds
 from ..logs import log
 from .cookies import _active_cookie_path
-
 
 _upstream_semaphores = {}
 _upstream_sema_lock = threading.Lock()

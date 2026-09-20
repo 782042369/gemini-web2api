@@ -5,19 +5,28 @@ from email.message import Message
 from email.utils import format_datetime
 from types import SimpleNamespace
 from unittest.mock import Mock
-from urllib.error import HTTPError as UrllibHTTPError, URLError
+from urllib.error import HTTPError as UrllibHTTPError
+from urllib.error import URLError
 
 import httpx
 import pytest
 from curl_cffi.requests import Response as CurlResponse
 from curl_cffi.requests import exceptions as curl_exceptions
 
-from gemini_web2api.budget import (QueueFull, QueueTimeout, RequestCancelled,
-                                  RequestControlError, RequestDeadlineExceeded)
+from gemini_web2api.budget import (
+    QueueFull,
+    QueueTimeout,
+    RequestCancelled,
+    RequestControlError,
+    RequestDeadlineExceeded,
+)
 from gemini_web2api.upstream import retry
-from gemini_web2api.upstream.retry import (EmptyUpstreamResponse, RetryDecision,
-                                         UpstreamRejection, retry_decision)
-
+from gemini_web2api.upstream.retry import (
+    EmptyUpstreamResponse,
+    RetryDecision,
+    UpstreamRejection,
+    retry_decision,
+)
 
 _HTTP_TRANSPORTS = ("httpx", "curl", "urllib")
 _TRANSIENT = (408, 425, 429, 500, 502, 503, 504)

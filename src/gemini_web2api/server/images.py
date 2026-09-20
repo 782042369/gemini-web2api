@@ -1,6 +1,6 @@
 """Image upload helper shared by every API protocol handler."""
-from ..config import CONFIG
 from ..budget import RequestControlError, check_budget
+from ..config import CONFIG
 from ..multimodal import detect_image_mime, fetch_image_bytes, upload_image
 
 
