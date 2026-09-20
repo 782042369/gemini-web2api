@@ -6,6 +6,10 @@ semver.
 
 ## [Unreleased]
 
+### README rewrite (2026-09-20)
+
+- Both language editions (README.md / README_CN.md) fully rewritten from repository evidence: centered identity band, architecture ASCII diagram, verified Quick Start, current model table (3.8 default), vision/vision_mode guide, cookie and DBSC notes, complete configuration reference, development workflow. No emoji; every claim traceable to the source tree.
+
 ### XSRF self-heal retry + model-routing verification (2026-09-20)
 
 - Live matrix (9 variants against StreamGenerate) verified our model routing: body `inner[79]` routes correctly with the neutral `x-goog-ext-525001261` ticket; `inner[80]` is deliberately NOT sent (`[80]=1` was observed to break `[79]` routing) and the ticket's `[14]/[15]` slots (upstream PR#100's channel) stay null - findings documented in `models.py`.
