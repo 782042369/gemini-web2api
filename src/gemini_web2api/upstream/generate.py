@@ -49,6 +49,27 @@ def _refresh_xsrf():
     check_budget("session refresh")
 
 
+def _heal_xsrf_rejection(error) -> bool:
+    """Detect an XSRF rejection and invalidate tokens for one retry.
+
+    Args:
+        error: Exception raised by a failed generate attempt.
+
+    Returns:
+        True when the failure was an XSRF rejection and cached tokens
+        were invalidated - the caller should retry immediately (at most
+        once per request; the token rotates server-side within minutes,
+        see upstream Sophomoresty/gemini-web2api PR#100).
+    """
+    from ..keepalive import invalidate_session_tokens, xsrf_rejection
+    if not xsrf_rejection(error):
+        return False
+    check_budget("session refresh")
+    invalidate_session_tokens()
+    log(f"upstream XSRF rejection ({type(error).__name__}); tokens refreshed for retry")
+    return True
+
+
 def _is_transport_error(error):
     """Check classifier compatibility. Args: exception. Returns: transport category flag."""
     return retry_decision(error, 0).category == "transport"
@@ -225,6 +246,7 @@ def _generate_upstream(prompt, model_id, think_mode, file_refs=None, extra_field
     with budget_scope():
         request_uuid = str(uuid.uuid4()).upper()
         attempts = _attempts()
+        xsrf_heals = 0
         for attempt in range(attempts):
             try:
                 with _UpstreamSlot():
@@ -244,6 +266,9 @@ def _generate_upstream(prompt, model_id, think_mode, file_refs=None, extra_field
                     schedule_history_delete(extract_conversation_id(raw))
                 return text
             except Exception as exc:
+                if xsrf_heals < 1 and attempt + 1 < attempts and _heal_xsrf_rejection(exc):
+                    xsrf_heals += 1
+                    continue
                 if not _retry(exc, attempt, attempts):
                     raise
 
@@ -282,6 +307,7 @@ def _generate_stream_owned(prompt, model_id, think_mode, file_refs, extra_fields
     """Run a stream under the wrapper's active budget. Args: generation fields. Yields: deltas."""
     request_uuid = str(uuid.uuid4()).upper()
     attempts = _attempts()
+    xsrf_heals = 0
     for attempt in range(attempts):
         emitted = False
         raw_text = ""
@@ -346,6 +372,10 @@ def _generate_stream_owned(prompt, model_id, think_mode, file_refs, extra_fields
             log(f"Upstream stream: ttfb={ttfb} total={time.monotonic() - started:.2f}s chars={len(raw_text)} attempt={attempt + 1}")
             return
         except Exception as exc:
+            if (xsrf_heals < 1 and not emitted and attempt + 1 < attempts
+                    and _heal_xsrf_rejection(exc)):
+                xsrf_heals += 1
+                continue
             if not _retry(exc, attempt, attempts, emitted=emitted):
                 raise
 

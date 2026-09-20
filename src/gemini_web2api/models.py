@@ -4,6 +4,14 @@ from .config import CONFIG
 
 # MODE_CATEGORY enum from 028-6eb337387583.js:
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
+#
+# Routing (live matrix 2026-09-20 against StreamGenerate): body inner[79]
+# routes models correctly together with the neutral x-goog-ext-525001261
+# ticket; inner[80] is deliberately NOT sent - [80]=1 was observed to
+# break [79] routing. The ticket header's [14]/[15] slots are an
+# alternative routing channel that overrides body fields when set (see
+# upstream Sophomoresty/gemini-web2api PR#100); they stay null unless
+# upstream behavior changes.
 
 MODELS = {
     "gemini-3.8-flash": {

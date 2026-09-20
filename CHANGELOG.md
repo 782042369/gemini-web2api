@@ -6,6 +6,11 @@ semver.
 
 ## [Unreleased]
 
+### XSRF self-heal retry + model-routing verification (2026-09-20)
+
+- Live matrix (9 variants against StreamGenerate) verified our model routing: body `inner[79]` routes correctly with the neutral `x-goog-ext-525001261` ticket; `inner[80]` is deliberately NOT sent (`[80]=1` was observed to break `[79]` routing) and the ticket's `[14]/[15]` slots (upstream PR#100's channel) stay null - findings documented in `models.py`.
+- XSRF self-heal (from upstream Sophomoresty/gemini-web2api PR#100 §2, adapted): an upstream 400/401 XSRF rejection now invalidates every token cache layer (page tokens, account XSRF overrides, CDP bridge tokens) and retries once immediately - the at token rotates server-side within minutes, so requests no longer fail on a stale token until the 300s keepalive refresh.
+
 ### Vision direct-first hybrid with bridge token lending (2026-09-15)
 
 - New `vision_mode` config (`auto`/`bridge`/`direct`, default `auto`): image requests prefer the direct server-side chain (upload + StreamGenerate on the curl_cffi TLS session) whenever a live token set is available, and use the CDP bridge otherwise and as fallback on upload/generate failure (non-stream).

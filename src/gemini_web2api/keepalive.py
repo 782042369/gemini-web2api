@@ -18,7 +18,8 @@ from .budget import RequestControlError
 from .logs import log
 from .upstream import generate
 from .upstream.cookies import (
-    _active_cookie_path, _cookie_paths, _cookie_caches,
+    _account_state, _account_state_lock, _active_cookie_path,
+    _cookie_paths, _cookie_caches,
     _cookie_lock as _cookie_write_lock,
     get_active_xsrf_token, load_cookie, set_active_cookie,
     set_active_xsrf_token, restore_active_cookie,
@@ -202,6 +203,71 @@ def _maybe_refresh_xsrf():
         raise
     except Exception as e:
         log(f"xsrf refresh failed for {path}: {e}")
+
+
+def xsrf_rejection(exc) -> bool:
+    """Detect an upstream XSRF rejection from a raised transport error.
+
+    Args:
+        exc: Exception raised by the transport (curl_cffi/httpx/urllib).
+
+    Returns:
+        True when the failure looks like a stale or missing at token:
+        HTTP 400/401 with "xsrf" in the body, or an unreadable-body
+        400 (payload errors normally carry a readable body, and one
+        token refresh + retry is cheap either way).
+    """
+    resp = getattr(exc, "response", None)
+    status = None
+    body = ""
+    if resp is not None:
+        status = getattr(resp, "status_code", None)
+        try:
+            body = (resp.text or "")[:2000]
+        except Exception:
+            body = ""
+    else:
+        status = getattr(exc, "code", None)  # urllib.error.HTTPError
+        body = ""  # the reason phrase carries no response body
+    if status not in (400, 401):
+        return False
+    if body:
+        return "xsrf" in body.lower()
+    return True
+
+
+def invalidate_session_tokens() -> None:
+    """Drop cached XSRF/page-token state so the next attempt re-mints it.
+
+    Clears every account's page-token cache entry, the CDP bridge token
+    cache and the in-memory account XSRF overrides. Called after an
+    upstream XSRF rejection (400 "xsrf") - the token rotates server-side
+    within minutes (upstream Sophomoresty/gemini-web2api PR#100), so the
+    next generate attempt re-fetches at from the live page (or the
+    bridge) instead of failing the request.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+    """
+    from .multimodal import _page_tokens_cache, _page_tokens_lock
+    try:
+        from .vision_bridge import _bridge_token_lock, _bridge_token_state
+    except Exception:
+        _bridge_token_lock = None
+        _bridge_token_state = None
+    with _page_tokens_lock:
+        _page_tokens_cache.clear()
+    with _account_state_lock:
+        for state in _account_state.values():
+            state.pop("xsrf_token", None)
+    if _bridge_token_state is not None:
+        with _bridge_token_lock:
+            _bridge_token_state.update(tokens=None, ts=0.0, fail_ts=0.0)
+    _xsrf_refreshed_at.clear()
+    log("session tokens invalidated for xsrf self-heal")
 
 
 _keepalive_lock = threading.Lock()
