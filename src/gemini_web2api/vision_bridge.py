@@ -171,7 +171,8 @@ def _page_chain_js(prompt: str, images: list,
     if (!at || !pushId) return out({stage: 'session', err: 'session not ready (no at/push_id; logged in?)'});
     var entries = [];
     var EXT = {'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp',
-               'image/gif': 'gif', 'image/bmp': 'bmp'};
+               'image/gif': 'gif', 'image/bmp': 'bmp',
+               'image/heic': 'heic', 'image/heif': 'heic', 'image/avif': 'avif'};
     for (var i = 0; i < PAYLOAD.images.length; i++) {
       var img = PAYLOAD.images[i];
       var name = 'image_' + (i + 1) + '.' + (EXT[img.mime] || 'png');
