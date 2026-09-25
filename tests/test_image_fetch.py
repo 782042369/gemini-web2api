@@ -558,8 +558,8 @@ class ImageFetchTests(unittest.TestCase):
         self.urlopen.assert_not_called()
         self._assert_closed(sock)
 
-    def test_redirects_never_follow_location_and_close_response(self):
-        """Reject every redirect class, including public and private locations.
+    def test_redirects_to_private_locations_rejected(self):
+        """Redirects pointing at private addresses fail closed like direct ones.
 
         Args:
             None.
@@ -575,6 +575,107 @@ class ImageFetchTests(unittest.TestCase):
                 self.assertEqual(self.dns.call_count, 1)
                 self.assertEqual(len(sock.connected), 1)
                 self._assert_closed(sock)
+
+    def test_public_redirect_followed_with_per_hop_validation(self):
+        """A redirect to another public host is followed and re-validated.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        first = _FakeSocket(_wire(status=302, headers=(("Location", "http://cdn.example/img.png"),)))
+        second = self._serve(_wire(headers=(("Content-Length", "5"),)))
+        self.factory.side_effect = None
+        self.factory.side_effect = [first, second]
+        self.assertEqual(
+            image_fetch.fetch_image_bytes("http://images.example/a"), b"image")
+        self.assertEqual(len(first.connected), 1)
+        self.assertEqual(len(second.connected), 1)
+        self.assertEqual(self.dns.call_count, 2)  # each hop re-resolved
+        self._assert_closed(first)
+        self._assert_closed(second)
+
+    def test_relative_redirect_followed_on_same_host(self):
+        """A relative Location resolves against the current URL and follows.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        first = _FakeSocket(_wire(status=301, headers=(("Location", "/final.png"),)))
+        second = self._serve(_wire(headers=(("Content-Length", "5"),)))
+        self.factory.side_effect = [first, second]
+        self.assertEqual(
+            image_fetch.fetch_image_bytes("http://images.example/a"), b"image")
+        self.assertIn(b"GET /final.png", bytes(second.sent))
+        self._assert_closed(first)
+        self._assert_closed(second)
+
+    def test_redirect_hop_limit_and_loops_rejected(self):
+        """Chains longer than three hops, and loops, terminate the fetch.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        chain = [_FakeSocket(_wire(status=302, headers=(("Location", f"http://h{n}.example/x"),)))
+                 for n in range(5)]
+        ok = self._serve(_wire(headers=(("Content-Length", "5"),)))
+        self.factory.side_effect = [*chain, ok]
+        self.assertEqual(
+            image_fetch.fetch_image_bytes("http://images.example/a"), b"")
+        self.assertEqual(sum(len(s.connected) for s in chain), 4)  # 1 + 3 hops
+
+        loop_a = _FakeSocket(_wire(status=302, headers=(("Location", "http://images.example/a"),)))
+        unused = _FakeSocket()
+        self.factory.side_effect = [loop_a, unused]
+        self.assertEqual(
+            image_fetch.fetch_image_bytes("http://images.example/a"), b"")
+        self.assertEqual(len(loop_a.connected), 1)
+        self.assertEqual(len(unused.connected), 0)  # loop caught pre-connect
+
+    def test_connect_refused_retried_once_then_succeeds(self):
+        """A TCP refusal during connect triggers exactly one retry.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        refused = _FakeSocket()
+        refused.connect_error = ConnectionRefusedError()
+        ok = self._serve(_wire(headers=(("Content-Length", "5"),)))
+        self.factory.side_effect = [refused, ok]
+        self.assertEqual(
+            image_fetch.fetch_image_bytes("http://images.example/a"), b"image")
+        self.assertEqual(len(refused.connected), 1)
+        self.assertEqual(len(ok.connected), 1)
+
+    def test_connect_refused_persists_fails_without_second_retry(self):
+        """Two consecutive refusals end the fetch (no third attempt).
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        one = _FakeSocket()
+        one.connect_error = ConnectionRefusedError()
+        two = _FakeSocket()
+        two.connect_error = ConnectionRefusedError()
+        self.factory.side_effect = [one, two, AssertionError("no third socket")]
+        self.assertEqual(
+            image_fetch.fetch_image_bytes("http://images.example/a"), b"")
+        self.assertEqual(len(one.connected), 1)
+        self.assertEqual(len(two.connected), 1)
 
     def test_success_closes_response_for_keepalive_and_connection_close(self):
         """Release both socket and file refs regardless of server persistence.

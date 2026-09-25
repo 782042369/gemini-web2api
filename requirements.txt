@@ -1,3 +1,6 @@
 httpx>=0.25
 curl_cffi>=0.16
 websocket-client>=1.6
+# Vision preprocessing: downscale/transcode before upload (optional at
+# runtime - the pipeline degrades to passthrough without it).
+Pillow>=10.0

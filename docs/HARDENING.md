@@ -30,6 +30,8 @@ Once HTTP 200 SSE headers are sent, errors cannot change the HTTP status. Chat e
 | request_body_timeout_sec | 30 | Positive **total** body-read budget, not an idle timeout |
 | max_image_bytes | 20971520 (20 MiB) | Maximum downloaded or uploaded image size |
 | allow_private_image_urls | false | Explicit opt-in for ordinary private/loopback image hosts |
+| vision_max_edge_px | 2048 | Longest image edge (px) fed to either vision chain; larger edges are LANCZOS-downsampled and re-encoded (EXIF-rotated, exotic containers transcoded) before upload |
+| vision_tab_keepalive_sec | 0 (off) | Reload the CDP Gemini tab every N seconds to keep DBSC rotation and the page-level at token fresh through idle periods (2026-09-24 root cause); requires keepalive_sec > 0 |
 
 The HTTP reader rejects duplicate Content-Length, Transfer-Encoding plus Content-Length, unsupported encodings, signed or malformed lengths, truncated chunks and invalid/oversized trailers. Bytes after the entity are left for the next keep-alive request. Rejected framing closes the connection; oversized bodies return 413 and body deadlines return 408. The body timeout is restored before generation starts.
 
@@ -60,10 +62,10 @@ New defaults are source-level changes only until an approved rebuild/deployment.
 Image downloads use a separate credential-free HTTP client, not the Google session:
 
 1. Parse an HTTP(S) URL without embedded credentials.
-2. Resolve a hostname at most once; reject mixed public/private answers.
+2. Resolve a hostname at most once per hop; reject mixed public/private answers.
 3. Connect only to validated numeric IPv4/IPv6 addresses. No second DNS lookup or automatic reconnect is allowed.
 4. For HTTPS, use the original IDNA hostname for SNI, Host and certificate validation.
-5. Reject every redirect. Supply the final image URL or an inline data URL instead.
+5. Follow redirects (301/302/303/307/308) up to **three hops**; every hop is re-parsed, re-resolved and re-validated through this same policy, redirect loops are detected and a Location pointing at a private/metadata address is rejected exactly like a direct request to it (OWASP per-hop revalidation). A TCP refusal/reset during connect is retried once within the remaining budget; TLS verification failures are never retried.
 6. Bound DNS wait, TCP/TLS, response headers and body by one 30-second budget; always close sockets and responses.
 
 Non-global, multicast, unspecified, known metadata and dangerous IPv6 transition destinations are denied. Private opt-in permits normal internal hosts but does not allow metadata or multicast destinations, and never disables TLS verification. Invalid/nonpositive download size configuration falls back to 20 MiB; the downloader also has a 100 MiB hard ceiling.

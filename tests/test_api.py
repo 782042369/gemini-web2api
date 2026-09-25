@@ -356,6 +356,71 @@ class StreamingEndpointTests(unittest.TestCase):
 
         self.assertEqual(status, 502)
         self.assertIn("image upload failed: upload denied", json.loads(body)["error"]["message"])
+    def _vision_payload(self):
+        """Build a minimal image-bearing chat payload. Args: none. Returns: dict."""
+        image_data = base64.b64encode(b"fake png").decode()
+        return {
+            "model": "gemini-3.6-flash",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}},
+                ],
+            }],
+        }
+
+    @mock.patch("gemini_web2api.server.openai_chat.vision_direct_ready", return_value=True)
+    @mock.patch("gemini_web2api.server.openai_chat.generate", return_value="rescued via direct")
+    @mock.patch("gemini_web2api.server.openai_chat._upload_images",
+                return_value=["/uploaded/rescue-ref"])
+    @mock.patch("gemini_web2api.server.openai_chat.vision_generate",
+                side_effect=RuntimeError("bridge exploded"))
+    @mock.patch("gemini_web2api.server.openai_chat.fetch_page_tokens",
+                return_value={"at": "AOvxALIVE"})
+    def test_bridge_mode_failure_rescues_via_direct_chain(
+            self, _tokens, _vg, _upload, _generate, _ready):
+        """A dead bridge with live borrowed tokens falls back to direct."""
+        CONFIG["vision_bridge_url"] = "http://bridge:22"
+        CONFIG["vision_mode"] = "bridge"
+
+        status, _, body = self.post_json("/v1/chat/completions", self._vision_payload())
+
+        self.assertEqual(status, 200)
+        self.assertIn("rescued via direct", body)
+
+    @mock.patch("gemini_web2api.server.openai_chat.vision_generate",
+                side_effect=RuntimeError("bridge exploded"))
+    @mock.patch("gemini_web2api.server.openai_chat.fetch_page_tokens", return_value={})
+    def test_bridge_not_logged_in_surfaces_actionable_error(self, _tokens, _vg):
+        """A logged-out tab reports vision_bridge_not_logged_in, not a 500."""
+        CONFIG["vision_bridge_url"] = "http://bridge:22"
+        CONFIG["vision_mode"] = "bridge"
+
+        status, _, body = self.post_json("/v1/chat/completions", self._vision_payload())
+
+        self.assertEqual(status, 502)
+        parsed = json.loads(body)
+        self.assertEqual(parsed["error"]["code"], "vision_bridge_not_logged_in")
+        self.assertIn("re-login", parsed["error"]["message"])
+
+    @mock.patch("gemini_web2api.server.openai_chat.vision_direct_available", return_value=False)
+    @mock.patch("gemini_web2api.server.openai_chat.vision_direct_ready", return_value=False)
+    @mock.patch("gemini_web2api.server.openai_chat.vision_generate",
+                side_effect=RuntimeError("bridge exploded"))
+    @mock.patch("gemini_web2api.server.openai_chat.fetch_page_tokens",
+                return_value={"at": "AOvxALIVE"})
+    def test_open_breaker_routes_straight_to_bridge(
+            self, _tokens, _vg, _avail, _ready):
+        """Auto mode with an open breaker never attempts the direct chain."""
+        CONFIG["vision_bridge_url"] = "http://bridge:22"
+        CONFIG["vision_mode"] = "auto"
+
+        status, _, body = self.post_json("/v1/chat/completions", self._vision_payload())
+
+        self.assertEqual(status, 502)
+        self.assertIn("bridge exploded", body)
+
 
     @mock.patch("gemini_web2api.server.google.generate_stream", return_value=iter(["streamed"]))
     def test_google_stream_generate_content_uses_sse(self, _generate_stream):

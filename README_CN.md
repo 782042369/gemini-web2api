@@ -131,9 +131,11 @@ compose 文件绑定 `127.0.0.1:8081:8081`，挂载 `./config.json`、cookie 文
 
 | `vision_mode` | 行为 |
 |--------------|------|
-| `auto` | 有活令牌时直连优先；否则走桥，且作为直连失败兜底 |
-| `bridge` | 始终走 CDP 标签页 |
+| `auto` | 有活令牌且健康时直连优先（直连连续失败 3 次进入 60s 熔断冷却，期间直跳桥）；否则走桥，且作为直连失败兜底；桥失败而借出的令牌仍有效时反向走一次直连救援 |
+| `bridge` | 始终先走 CDP 标签页；失败且借出令牌仍有效时用直连链救援一次 |
 | `direct` | 永不走桥 |
+
+无论走哪条链，每张图片（内联或下载）先过统一预处理：EXIF 转正、长边限制（`vision_max_edge_px`，默认 2048px LANCZOS）、异构容器转码（Pillow+pillow-heif 时支持 HEIC/AVIF/BMP/TIFF）、按链路字节预算迭代重压缩（超限手机照片压缩后仍可识，不再硬拒）。远程 `image_url` 下载最多跟随 3 跳重定向（逐跳地址钉扎与私网重校验，私网/元数据目标依旧拒绝），TCP 拒绝重试一次，同图重复上传经短时哈希缓存去重。桥链路对会话陈旧（ProcessFile 错误码 7）自动 reload 标签页重试一次，登记持续失败时自动降级为裸引用附件形态，并把请求的模型/思考档位透传进页面。调研背景与取舍见 [docs/VISION_RESEARCH.md](docs/VISION_RESEARCH.md)。
 
 ## 配置
 
@@ -149,6 +151,8 @@ compose 文件绑定 `127.0.0.1:8081:8081`，挂载 `./config.json`、cookie 文
 | `impersonate` | `chrome145` | curl_cffi TLS 指纹档位 |
 | `vision_bridge_url` | `null` | 识图桥的 CDP 端点 |
 | `vision_mode` | `auto` | 识图路由（auto/bridge/direct） |
+| `vision_max_edge_px` | `2048` | 送入模型的最长图片边（像素） |
+| `vision_tab_keepalive_sec` | `0`（关） | 定期 reload CDP 标签页保持 at 令牌新鲜（需开启 keepalive） |
 | `keepalive_sec` | `540` | 后台会话保活间隔 |
 | `retry_attempts` / `retry_delay_sec` | `3` / `2` | 上游重试策略 |
 | `request_timeout_sec` / `slow_retry_sec` | `180` / `60` | 单次尝试上限 |

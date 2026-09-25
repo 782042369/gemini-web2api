@@ -69,6 +69,16 @@ DEFAULT_CONFIG = {
     "max_image_bytes": 20 * 1024 * 1024,
     "request_body_timeout_sec": 30,
     "allow_private_image_urls": False,
+    # Vision preprocessing: longest image edge (px) fed to either chain.
+    # Larger edges are LANCZOS-downsampled; 0 falls back to the default.
+    # Keeps CDP evaluate payloads small and model token usage sane.
+    "vision_max_edge_px": 2048,
+    # Vision tab keepalive ring: reload the CDP Gemini tab every N seconds
+    # to keep DBSC rotation and the page-level at token fresh during idle
+    # periods (root cause of the 2026-09-24 stale-session outage). 0=off;
+    # enable only with an explicit ops decision (each reload minted fresh
+    # tokens; a logged-out tab stays logged out and only logs a warning).
+    "vision_tab_keepalive_sec": 0,
 }
 
 # Known key types for validation: "int", "float", "str", "bool", "list".
@@ -86,6 +96,7 @@ _TYPED_KEYS = {
     "impersonate": "str", "vision_mode": "str",
     "log_file": "str", "log_retention_days": "int",
     "max_request_body_bytes": "int", "max_image_bytes": "int",
+    "vision_max_edge_px": "int", "vision_tab_keepalive_sec": "int",
     "request_body_timeout_sec": "int", "allow_private_image_urls": "bool",
     "log_requests": "bool", "temporary_chats": "bool",
     "auto_delete_history": "bool",

@@ -6,6 +6,18 @@ semver.
 
 ## [Unreleased]
 
+### Vision pipeline research pass (2026-09-24)
+
+Full research report and rationale: docs/VISION_RESEARCH.md (reverse-engineered Gemini projects x LLM-gateway image-pipeline practices).
+
+- New image preprocessing pipeline (image_prep.py): EXIF rotation, long-edge cap (vision_max_edge_px, default 2048), HEIC/AVIF/BMP/TIFF transcode (pillow-heif optional extra), iterative budget re-encode - oversized phone photos are now compressed instead of hard-rejected by the 4 MiB bridge limit. DecompressionBomb warnings upgraded to errors.
+- Shared normalization entry (server/images.py::_normalize_images) for both chains: URL download + magic-byte sniff + prepare; fixes a crash where http-linked images in bridge mode raised TypeError before any upload. Upload references cached by content hash (15 min TTL, 64-entry LRU).
+- Redirect following for remote image_url (up to 3 hops, per-hop address pinning and private/metadata re-validation, loop detection) plus a single TCP-refusal retry; TLS failures stay non-retryable (docs/HARDENING.md updated).
+- Bridge chain hardening: the documented single-tab lock is actually wired (bounded 120s wait); every in-page failure carries a stage/error code; ProcessFile error 7 (stale session) triggers one tab reload + retry (automates the 2026-09-24 idle-tab outage class); persistent registration failures fall back to bare-reference attachments (the reference-client form); upload filenames now carry the correct extension per MIME (g4f #3064); requested model/thinking level flows into the page payload.
+- Direct-chain circuit breaker (3 consecutive failures -> 60s cooldown, auto mode goes straight to the bridge) and a reverse rescue: a failed bridge attempt with live borrowed tokens is served once through the direct chain instead of a terminal 502.
+- Optional vision tab keepalive ring (vision_tab_keepalive_sec, default off): periodic CDP tab reload keeping DBSC rotation and the at token fresh; enabling it is an ops decision (KEY.md 2026-09-24 proposal B).
+- Pillow added to dependencies; vision-heic optional extra; 820 offline tests (was 794), ruff clean.
+
 ### README rewrite (2026-09-20)
 
 - Both language editions (README.md / README_CN.md) fully rewritten from repository evidence: centered identity band, architecture ASCII diagram, verified Quick Start, current model table (3.8 default), vision/vision_mode guide, cookie and DBSC notes, complete configuration reference, development workflow. No emoji; every claim traceable to the source tree.

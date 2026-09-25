@@ -1,5 +1,6 @@
 """Offline tests for vision_mode routing, bridge token merge and readiness."""
 import threading
+import time
 
 import pytest
 
@@ -147,3 +148,195 @@ def test_token_cache_ttl_requires_at():
     finally:
         monkey.undo()
         multimodal._page_tokens_cache.clear()
+# ---------------------------------------------------------------------------
+# Circuit breaker, chain classification and payload passthrough (2026-09).
+# ---------------------------------------------------------------------------
+
+
+def test_direct_breaker_opens_and_recovers():
+    """Three consecutive direct failures cool the chain down for 60s."""
+    multimodal._direct_breaker.update(fails=0, cool_until=0.0)
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(multimodal, "_cached_page_tokens",
+                        lambda: {"push_id": "P", "at": "AOvx1"})
+        assert multimodal.vision_direct_available() is True
+        for _ in range(3):
+            multimodal.note_direct_vision_outcome(False)
+        assert multimodal.vision_direct_available() is False
+        assert multimodal.vision_direct_ready() is True  # tokens still fine
+        multimodal.note_direct_vision_outcome(True)  # (unreachable while open)
+    finally:
+        monkey.undo()
+        multimodal._direct_breaker.update(fails=0, cool_until=0.0)
+    # cooldown expiry restores availability
+    multimodal._direct_breaker.update(fails=0, cool_until=0.0)
+    monkey2 = pytest.MonkeyPatch()
+    try:
+        monkey2.setattr(multimodal, "_cached_page_tokens",
+                        lambda: {"push_id": "P", "at": "AOvx1"})
+        multimodal._direct_breaker.update(fails=3, cool_until=multimodal.time.monotonic() - 1)
+        assert multimodal.vision_direct_available() is True
+    finally:
+        monkey2.undo()
+        multimodal._direct_breaker.update(fails=0, cool_until=0.0)
+
+
+def test_breaker_requires_ready_tokens():
+    """An open internet circuit cannot make an unavailable chain available."""
+    multimodal._direct_breaker.update(fails=0, cool_until=0.0)
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(multimodal, "_cached_page_tokens", lambda: {"push_id": "P"})
+        assert multimodal.vision_direct_available() is False
+    finally:
+        monkey.undo()
+
+
+def test_classify_chain_failure_matrix():
+    """Stage/code pairs map to the three retry verdicts."""
+    cases = [
+        ({"stage": "process_file", "code": 7, "err": "x"}, "stale_session"),
+        ({"stage": "process_file", "code": 8, "err": "x"}, "stale_session"),
+        ({"stage": "process_file", "code": None, "err": "session binding"}, "stale_session"),
+        ({"stage": "upload_start", "err": "upload start failed 500"}, "transient"),
+        ({"stage": "upload", "err": "upload failed"}, "transient"),
+        ({"stage": "exception", "err": "chain exception: x"}, "transient"),
+        ({"stage": "session", "err": "no at"}, "fatal"),
+        ({"stage": "generate", "err": "upstream rejected: 1100"}, "fatal"),
+        ({"err": "weird"}, "fatal"),
+        ({"stage": "process_file", "code": 42, "err": "other"}, "fatal"),
+    ]
+    for data, expected in cases:
+        assert vision_bridge._classify_chain_failure(data) == expected, data
+
+
+def test_page_chain_js_carries_model_and_extensions():
+    """The page payload forwards model/think and correct file extensions."""
+    js = vision_bridge._page_chain_js(
+        "hi", [(b"a", "image/jpeg"), (b"b", "image/webp")], 2, 0)
+    assert '"model_id": 2' in js
+    assert '"think_mode": 0' in js
+    assert "'jpg'" in js and "'webp'" in js
+    bare = vision_bridge._page_chain_js("hi", [(b"a", "image/png")], 1, None, True)
+    assert '"bare_ref": true' in bare
+    assert 'if (PAYLOAD.bare_ref)' in bare
+
+
+def test_vision_generate_serializes_chains(monkeypatch):
+    """Concurrent generates run one at a time under the bridge lock."""
+    CONFIG["vision_bridge_url"] = "http://bridge:22"
+    events = []
+    fake_js = "js"
+
+    def fake_chain(js):
+        """Assert the lock is held while a chain runs. Args: js. Returns: dict."""
+        assert vision_bridge._bridge_lock.acquire(blocking=False) is False
+        events.append("enter")
+        time.sleep(0.05)
+        events.append("exit")
+        return {"sg": "payload"}
+
+    monkeypatch.setattr(vision_bridge, "_page_chain_js", lambda *a, **k: fake_js)
+    monkeypatch.setattr(vision_bridge, "_run_page_chain", fake_chain)
+    monkeypatch.setattr("gemini_web2api.image_prep.prepare_image",
+                        lambda data, mime, budget, **k: (data, mime))
+
+    threads = [threading.Thread(
+        target=lambda: vision_bridge.vision_generate("p", [(b"imgdata", "image/png")]))
+        for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert events[0] == "enter" and events[1] == "exit", events
+
+
+def test_vision_generate_stale_session_reloads_and_retries(monkeypatch):
+    """A ProcessFile code-7 failure triggers one reload + retry."""
+    CONFIG["vision_bridge_url"] = "http://bridge:22"
+    calls = {"chain": 0, "reload": 0}
+
+    def fake_chain(js):
+        """Fail the registered chain once, then succeed. Args: js. Returns: dict."""
+        calls["chain"] += 1
+        if calls["chain"] == 1:
+            return {"stage": "process_file", "code": 7, "err": "stale"}
+        return {"sg": "recovered"}
+
+    monkeypatch.setattr(vision_bridge, "_page_chain_js", lambda *a, **k: "js")
+    monkeypatch.setattr(vision_bridge, "_run_page_chain", fake_chain)
+    monkeypatch.setattr(vision_bridge, "_reload_gemini_tab",
+                        lambda: calls.update(reload=1) or {"at": "AOvxNEW"})
+    monkeypatch.setattr("gemini_web2api.image_prep.prepare_image",
+                        lambda data, mime, budget, **k: (data, mime))
+    out = vision_bridge.vision_generate("p", [(b"img", "image/png")])
+    assert out == "recovered"
+    assert calls == {"chain": 2, "reload": 1}
+
+
+def test_vision_generate_bare_ref_fallback(monkeypatch):
+    """Persistent ProcessFile failure falls back to bare references."""
+    CONFIG["vision_bridge_url"] = "http://bridge:22"
+    payloads = []
+
+    def fake_chain(js):
+        """Record which chain form ran. Args: js. Returns: dict."""
+        payloads.append(js)
+        if len(payloads) == 1:
+            return {"stage": "process_file", "code": 42, "err": "no uuid"}
+        return {"sg": "bare ok"}
+
+    monkeypatch.setattr(vision_bridge, "_run_page_chain", fake_chain)
+    monkeypatch.setattr(vision_bridge, "_reload_gemini_tab", lambda: {})
+    monkeypatch.setattr("gemini_web2api.image_prep.prepare_image",
+                        lambda data, mime, budget, **k: (data, mime))
+    out = vision_bridge.vision_generate("p", [(b"img", "image/jpeg")])
+    assert out == "bare ok"
+    assert len(payloads) == 2  # registered, then bare-ref form
+
+
+def test_vision_generate_busy_lock_times_out(monkeypatch):
+    """A held bridge lock surfaces a busy error instead of queueing forever."""
+    CONFIG["vision_bridge_url"] = "http://bridge:22"
+    monkeypatch.setattr(vision_bridge, "_BRIDGE_CHAIN_WAIT", 0.05)
+    monkeypatch.setattr("gemini_web2api.image_prep.prepare_image",
+                        lambda data, mime, budget, **k: (data, mime))
+    acquired = vision_bridge._bridge_lock.acquire()
+    assert acquired
+    try:
+        with pytest.raises(vision_bridge.VisionBridgeError, match="busy"):
+            vision_bridge.vision_generate("p", [(b"img", "image/png")])
+    finally:
+        vision_bridge._bridge_lock.release()
+
+
+def test_keepalive_vision_ring_gated_and_fires(monkeypatch):
+    """The tab-reload ring only runs when configured, then reloads."""
+    from gemini_web2api import keepalive
+    keepalive._vision_tab_last["ts"] = 0.0
+    CONFIG["vision_bridge_url"] = "http://bridge:22"
+    try:
+        CONFIG["vision_tab_keepalive_sec"] = 0
+        keepalive._maybe_keep_vision_tab()  # disabled: no-op
+        CONFIG["vision_tab_keepalive_sec"] = 600
+        reloaded = []
+        warmed = []
+        monkeypatch = pytest.MonkeyPatch()
+        try:
+            monkeypatch.setattr("gemini_web2api.vision_bridge.vision_bridge_enabled",
+                                lambda: True)
+            monkeypatch.setattr("gemini_web2api.vision_bridge._reload_gemini_tab",
+                                lambda: reloaded.append(1) or {"at": "AOvx1"})
+            monkeypatch.setattr("gemini_web2api.vision_bridge.fetch_page_tokens",
+                                lambda force=False: warmed.append(force) or {"at": "AOvx1"})
+            keepalive._maybe_keep_vision_tab()
+            assert reloaded == [1] and warmed == [True]
+            keepalive._maybe_keep_vision_tab()  # within interval: skipped
+            assert reloaded == [1]
+        finally:
+            monkeypatch.undo()
+    finally:
+        CONFIG["vision_tab_keepalive_sec"] = 0
+        keepalive._vision_tab_last["ts"] = 0.0
+

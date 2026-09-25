@@ -131,9 +131,11 @@ Two serving paths, selected by `vision_mode` in `config.json`:
 
 | `vision_mode` | Behavior |
 |--------------|----------|
-| `auto` | Direct chain first when a live token set exists; bridge otherwise and as fallback |
-| `bridge` | Always the CDP tab |
+| `auto` | Direct chain first when a live token set exists and healthy (3 consecutive direct failures open a 60s cooldown); bridge otherwise, as fallback - and a failing bridge with live borrowed tokens is rescued through the direct chain once |
+| `bridge` | Always the CDP tab first; on failure the direct chain rescues when borrowed tokens are still live |
 | `direct` | Never the bridge |
+
+Every image - inline or downloaded - passes one preparation pipeline before either chain: EXIF rotation, long-edge cap (`vision_max_edge_px`, default 2048px LANCZOS), transcode of exotic containers (HEIC/AVIF/BMP/TIFF with Pillow+pillow-heif) and iterative re-encoding to the chain's byte budget (oversized phone photos are compressed instead of rejected). Remote `image_url` downloads follow up to three redirects with per-hop address re-validation (private/metadata targets stay rejected), retry one TCP refusal and deduplicate identical uploads through a short-lived hash cache. The bridge chain self-heals a stale session (ProcessFile error 7) with one tab reload + retry, falls back to bare-reference attachments when registration keeps failing, and forwards the requested model/thinking level into the page. Research background and trade-offs: [docs/VISION_RESEARCH.md](docs/VISION_RESEARCH.md).
 
 ## Configuration
 
@@ -149,6 +151,8 @@ All keys live in `config.json` (see `config.example.json` for the full annotated
 | `impersonate` | `chrome145` | curl_cffi TLS profile |
 | `vision_bridge_url` | `null` | CDP endpoint for the vision bridge |
 | `vision_mode` | `auto` | Vision routing (auto/bridge/direct) |
+| `vision_max_edge_px` | `2048` | Longest image edge fed to the model |
+| `vision_tab_keepalive_sec` | `0` (off) | Periodic CDP tab reload keeping the at token fresh (needs keepalive on) |
 | `keepalive_sec` | `540` | Background session refresh interval |
 | `retry_attempts` / `retry_delay_sec` | `3` / `2` | Upstream retry policy |
 | `request_timeout_sec` / `slow_retry_sec` | `180` / `60` | Per-attempt bounds |
@@ -162,7 +166,7 @@ All keys live in `config.json` (see `config.example.json` for the full annotated
 ## Development
 
 ```bash
-make test    # offline suite (no network; 794 tests)
+make test    # offline suite (no network; 820 tests)
 make lint    # ruff with the curated ruleset from pyproject.toml
 make run     # dev server from the source tree
 ```

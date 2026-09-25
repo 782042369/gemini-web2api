@@ -14,6 +14,12 @@ metadata endpoints or transition/translation IPv6 ranges. Scoped IPv6 URLs are
 unsupported. Network-specific NAT64 prefixes and privileged network routing are
 outside application-level IP validation; use an egress firewall as defense in depth.
 
+Redirects (301/302/303/307/308) are followed up to three hops. Every hop is
+re-resolved and re-validated through the same address-pinning policy as the
+original URL, redirect loops are detected, and a Location pointing at a
+private/metadata address is rejected exactly like a direct request to it.
+Ambiguous HTTP framing is still rejected; no cookies or authorization are sent.
+
 Bounds: max_image_bytes defaults to 20 MiB for missing/invalid/nonpositive values
 and is capped at 100 MiB. There is a 30-second overall deadline, including DNS
 queueing, TCP/TLS, response headers and body. Each raw socket read uses the remaining
@@ -239,6 +245,10 @@ def _resolve_addresses(target, allow_private, deadline):
     return tuple(endpoints)
 
 
+class _TransientConnectError(OSError):
+    """TCP-level connect refusal/reset; safe to retry once immediately."""
+
+
 def _connect_pinned(target, endpoints, deadline):
     """Dial only validated numeric IPs and preserve the TLS server identity.
 
@@ -267,6 +277,10 @@ def _connect_pinned(target, endpoints, deadline):
             return sock
         except BaseException as exc:
             sock.close()
+            if isinstance(exc, (ConnectionRefusedError, ConnectionResetError)):
+                # Mark connect-phase transients so the caller may retry
+                # once; TLS verification failures stay non-retryable.
+                raise _TransientConnectError(str(exc) or type(exc).__name__) from exc
             if not isinstance(exc, OSError) or isinstance(exc, ssl.SSLError):
                 raise
             last_error = exc
@@ -417,7 +431,8 @@ def _open_image_url(url, deadline, allow_private):
         allow_private: Explicit internal-unicast opt-in.
 
     Returns:
-        Context manager yielding HTTPResponse; redirects are errors, never followed.
+        Context manager yielding HTTPResponse for any status; the caller
+        decides whether to follow the redirect or read the body.
     """
     if CONFIG.get("proxy"):
         raise ValueError("image downloads disabled while CONFIG.proxy is configured (DNS pinning)")
@@ -437,8 +452,6 @@ def _open_image_url(url, deadline, allow_private):
             "Connection": "close",
         })
         response = connection.getresponse()
-        if not 200 <= response.status < 300:
-            raise ValueError(f"image HTTP status {response.status}; redirects are disabled")
         yield response
     finally:
         try:
@@ -446,6 +459,40 @@ def _open_image_url(url, deadline, allow_private):
                 response.close()
         finally:
             connection.close()
+
+
+_REDIRECT_STATUSES = frozenset((301, 302, 303, 307, 308))
+_MAX_REDIRECTS = 3
+
+
+def _next_hop(current, response):
+    """Resolve one redirect Location header into the next request URL.
+
+    Args:
+        current: The URL the redirect was served for (relative base).
+        response: The redirect HTTPResponse carrying a Location header.
+
+    Returns:
+        Absolute http(s) URL string for the next hop.
+
+    Raises:
+        ValueError: when Location is missing, malformed, uses a
+            non-http(s) scheme or embeds credentials.
+    """
+    location = response.headers.get("Location")
+    if not location:
+        raise ValueError("image redirect without Location header")
+    location = location.strip()
+    if not location:
+        raise ValueError("image redirect with empty Location header")
+    from urllib.parse import urljoin
+    target_url = urljoin(current, location)
+    parsed = urlsplit(target_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("image redirect target must use HTTP(S) with a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("image redirect target credentials are not supported")
+    return target_url
 
 
 def _byte_limit():
@@ -491,20 +538,38 @@ def _content_length(response, max_bytes):
     return length
 
 
-def fetch_image_bytes(url: str) -> bytes:
-    """Fetch a bounded image using validated-address pinning and strict TLS.
+def _fetch_once(url, deadline, max_bytes, allow_private):
+    """Run the hop loop for one image URL against one overall deadline.
 
     Args:
         url: Absolute HTTP(S) image URL, without embedded credentials.
+        deadline: Absolute overall monotonic deadline (shared by all hops).
+        max_bytes: Maximum acceptable image body length.
+        allow_private: Explicit internal-unicast opt-in.
 
     Returns:
-        Raw body bytes on success; b"" on policy rejection or download failure.
+        Raw body bytes on success.
+
+    Raises:
+        ValueError/OSError/TimeoutError: on policy rejection or failure.
     """
-    try:
-        deadline = time.monotonic() + remaining_timeout(_FETCH_TIMEOUT, "image download")
-        max_bytes = _byte_limit()
-        allow_private = CONFIG.get("allow_private_image_urls") is True
-        with _open_image_url(url, deadline, allow_private) as response:
+    current = url
+    hops = 0
+    visited = {url}
+    while True:
+        with _open_image_url(current, deadline, allow_private) as response:
+            if response.status in _REDIRECT_STATUSES:
+                nxt = _next_hop(current, response)
+                hops += 1
+                if hops > _MAX_REDIRECTS:
+                    raise ValueError("image redirect hop limit exceeded")
+                if nxt in visited:
+                    raise ValueError("image redirect loop detected")
+                visited.add(nxt)
+                current = nxt
+                continue
+            if not 200 <= response.status < 300:
+                raise ValueError(f"image HTTP status {response.status}")
             declared = _content_length(response, max_bytes)
             body = bytearray()
             while True:
@@ -519,10 +584,38 @@ def fetch_image_bytes(url: str) -> bytes:
             if declared is not None and len(body) != declared:
                 raise ValueError("truncated image body")
             return bytes(body)
+
+
+def fetch_image_bytes(url: str) -> bytes:
+    """Fetch a bounded image using validated-address pinning and strict TLS.
+
+    Redirects are followed (up to three hops) with full per-hop address
+    re-validation; one immediate retry is made for transient transport
+    errors (connection reset/refused) while budget remains.
+
+    Args:
+        url: Absolute HTTP(S) image URL, without embedded credentials.
+
+    Returns:
+        Raw body bytes on success; b"" on policy rejection or download failure.
+    """
+    try:
+        deadline = time.monotonic() + remaining_timeout(_FETCH_TIMEOUT, "image download")
+        max_bytes = _byte_limit()
+        allow_private = CONFIG.get("allow_private_image_urls") is True
+        try:
+            return _fetch_once(url, deadline, max_bytes, allow_private)
+        except _TransientConnectError as exc:
+            # TCP refusal/reset during connect: retry once within the
+            # remaining budget (never when the deadline is nearly spent).
+            if deadline - time.monotonic() < 5.0:
+                raise
+            log(f"Image fetch transient connect failure ({exc}); retrying once")
+            return _fetch_once(url, deadline, max_bytes, allow_private)
     except RequestControlError:
         raise
-    except Exception as exc:
+    except Exception:
         check_budget("image download")
         # Never include the URL/query (potential credentials) or response body.
-        log(f"Image fetch failed: {type(exc).__name__}")
+        log("Image fetch failed")
         return b""

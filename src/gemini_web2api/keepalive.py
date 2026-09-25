@@ -175,6 +175,50 @@ def _merge_response_cookies(resp) -> None:
 
 _xsrf_refreshed_at = {}  # cookie path -> last page-token refresh timestamp
 
+_vision_tab_last = {"ts": 0.0}
+
+
+def _maybe_keep_vision_tab():
+    """Reload the CDP Gemini tab on a config-gated schedule.
+
+    Root cause of the 2026-09-24 vision outage: an idle tab let the
+    page-level at token expire (ProcessFile error 7) and after a manual
+    reload Google stopped serving SNlM0e until re-login. A periodic
+    reload keeps DBSC rotation and the at token fresh through idle
+    periods. Disabled unless CONFIG["vision_tab_keepalive_sec"] > 0
+    (each reload also re-warms the borrowed-token cache). Runs inside
+    the keepalive loop, so it requires keepalive_sec > 0 as well.
+
+    Args:
+        None.
+
+    Returns:
+        None; failures are logged and never fatal.
+    """
+    try:
+        interval = float(CONFIG.get("vision_tab_keepalive_sec") or 0)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(interval) or interval <= 0:
+        return
+    now = time.monotonic()
+    if now - _vision_tab_last["ts"] < interval:
+        return
+    _vision_tab_last["ts"] = now
+    try:
+        from . import vision_bridge
+        if not vision_bridge.vision_bridge_enabled():
+            return
+        tokens = vision_bridge._reload_gemini_tab()
+        if tokens.get("at"):
+            vision_bridge.fetch_page_tokens(force=True)  # warm cache
+            log("vision tab keepalive: reloaded, tokens fresh")
+        else:
+            log("vision tab keepalive: reload produced no SNlM0e "
+                "(tab may need a manual Google re-login)")
+    except Exception as e:
+        log(f"vision tab keepalive failed: {e}")
+
 
 def _maybe_refresh_xsrf():
     """Refresh the active account XSRF token from its live app page.
@@ -473,6 +517,7 @@ def start_keepalive():
                     log(f"Keepalive tick: account={path} rotate={'ok' if ok else 'failed'}")
                 except Exception as e:
                     log(f"Keepalive loop error for {path}: {e}")
+            _maybe_keep_vision_tab()
 
     with _keepalive_lock:
         if _keepalive_on["started"]:

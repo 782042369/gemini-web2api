@@ -9,12 +9,17 @@ dependencies = [
     "httpx>=0.25",
     "curl_cffi>=0.16",
     "websocket-client>=1.6",
+    "Pillow>=10.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7",
     "ruff>=0.4",
+]
+# HEIC/HEIF decode for the vision preprocessing pipeline (iPhone photos).
+vision-heic = [
+    "pillow-heif>=0.13",
 ]
 
 [project.scripts]

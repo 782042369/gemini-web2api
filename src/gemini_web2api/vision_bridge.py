@@ -6,6 +6,17 @@ Gemini page of a CDP-attached Chrome (the llq desktop seat) that a real
 account has logged into. The bridge uploads each image, registers it via
 ProcessFile (receiving the attachment UUID) and sends StreamGenerate with
 the at token — the exact chain the web client uses.
+
+Hardening (2026-09 research pass):
+- Chains are serialized by _bridge_lock (bounded wait) so concurrent
+  evaluates never interleave on one tab.
+- Every in-page failure carries a stage tag; stale-session failures
+  (ProcessFile code 7) trigger one page reload + retry before giving up,
+  automating the 2026-09-24 idle-tab incident class.
+- Images are preprocessed (downscale/re-encode) to fit the CDP evaluate
+  payload limit instead of being rejected outright.
+- The requested model id and thinking level flow into the page payload
+  (they were silently dropped before).
 """
 import base64
 import json
@@ -13,6 +24,7 @@ import socket
 import threading
 import time
 import urllib.request
+from typing import Optional
 
 from .config import CONFIG
 from .logs import log
@@ -20,6 +32,13 @@ from .logs import log
 # One browser tab executes one chain at a time; the page-level tokens are
 # session-scoped and concurrent evaluates would interleave.
 _bridge_lock = threading.Lock()
+
+# How long a queued chain waits for the tab before failing (seconds).
+_BRIDGE_CHAIN_WAIT = 120.0
+# One full in-page chain (uploads + ProcessFile + StreamGenerate) budget.
+_BRIDGE_CHAIN_TIMEOUT = 180.0
+# Page reload + WIZ_global_data settle budget for the self-heal retry.
+_BRIDGE_RELOAD_WAIT = 45.0
 
 # Evaluate payloads beyond this size get slow/fragile through CDP.
 MAX_BRIDGE_IMAGE_BYTES = 4 * 1024 * 1024
@@ -106,23 +125,42 @@ def _find_gemini_tab() -> dict:
         "no gemini.google.com tab open in the bridge browser; open one and log in")
 
 
-def _page_chain_js(prompt: str, images: list) -> str:
+def _page_chain_js(prompt: str, images: list,
+                   model_id: Optional[int] = None,
+                   think_mode: Optional[int] = None,
+                   allow_bare_ref: bool = False) -> str:
     """Build the in-page chain script (upload -> ProcessFile -> StreamGenerate).
 
     Args:
         prompt: user prompt text (already JSON-escaped by json.dumps).
         images: list of (image_bytes, mime_type) tuples.
+        model_id: optional MODE_CATEGORY id for inner[79] (1=FAST when
+            omitted, the historical bridge behavior).
+        think_mode: optional thinking level for inner[17] (0 = dynamic).
+        allow_bare_ref: skip ProcessFile and send bare references - the
+            reference-client attachment form (see module docstring).
 
     Returns:
         JavaScript source string for Runtime.evaluate with awaitPromise.
+        Every error return carries a stage tag ("session", "upload_start",
+        "upload", "process_file", "generate", "exception") so the caller
+        can classify the failure; ProcessFile also extracts Google's
+        numeric error code (7 = stale at token / session).
+        allow_bare_ref skips ProcessFile entirely and sends uploaded
+        references straight to StreamGenerate - the form reference
+        clients (HanaokaYuzu/Gemini-API, Sophomoresty/gemini-web2api)
+        use, kept as the fallback when registration rejects.
     """
     parts = []
     for data, mime in images:
         b64 = base64.b64encode(data).decode()
         parts.append({"b64": b64, "mime": mime})
-    payload = json.dumps({"prompt": prompt, "images": parts})
+    payload = json.dumps({"prompt": prompt, "images": parts,
+                          "model_id": model_id, "think_mode": think_mode,
+                          "bare_ref": bool(allow_bare_ref)})
     return """(async function () {
   var PAYLOAD = %s;
+  function out(o) { return JSON.stringify(o); }
   try {
     function wiz(key) {
       var m = document.documentElement.innerHTML.match(new RegExp('"' + key + '":"([^"]+)"'));
@@ -130,10 +168,13 @@ def _page_chain_js(prompt: str, images: list) -> str:
     }
     var at = wiz('SNlM0e'), fsid = wiz('FdrFJe'), bl = wiz('cfb2h');
     var pushId = wiz('qKIAYe'), pctx = wiz('Ylro7b');
-    if (!at || !pushId) return JSON.stringify({err: 'session not ready (no at/push_id; logged in?)'});
+    if (!at || !pushId) return out({stage: 'session', err: 'session not ready (no at/push_id; logged in?)'});
     var entries = [];
+    var EXT = {'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp',
+               'image/gif': 'gif', 'image/bmp': 'bmp'};
     for (var i = 0; i < PAYLOAD.images.length; i++) {
       var img = PAYLOAD.images[i];
+      var name = 'image_' + (i + 1) + '.' + (EXT[img.mime] || 'png');
       var bytes = Uint8Array.from(atob(img.b64), function (c) { return c.charCodeAt(0); });
       var r1 = await fetch('https://push.clients6.google.com/upload/', {
         method: 'POST',
@@ -142,10 +183,10 @@ def _page_chain_js(prompt: str, images: list) -> str:
                   'X-Goog-Upload-Command': 'start', 'X-Goog-Upload-Protocol': 'resumable',
                   'X-Goog-Upload-Header-Content-Length': String(bytes.length),
                   'X-Tenant-Id': 'bard-storage'},
-        body: 'File name: image_' + (i + 1) + '.png'
+        body: 'File name: ' + name
       });
       var putUrl = r1.headers.get('x-goog-upload-url');
-      if (!putUrl) return JSON.stringify({err: 'upload start failed ' + r1.status});
+      if (!putUrl) return out({stage: 'upload_start', err: 'upload start failed ' + r1.status});
       var r2 = await fetch(putUrl, {
         method: 'POST',
         headers: {'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
@@ -155,8 +196,12 @@ def _page_chain_js(prompt: str, images: list) -> str:
         body: bytes
       });
       var ref = (await r2.text()).trim();
-      if (ref.indexOf('/contrib') !== 0) return JSON.stringify({err: 'upload failed: ' + ref.slice(0, 80)});
-      var pfInner = [[[ref, null, 1, img.mime], 'image_' + (i + 1) + '.png'], null, 1, ['zh-CN']];
+      if (ref.indexOf('/contrib') !== 0) return out({stage: 'upload', err: 'upload failed: ' + ref.slice(0, 80)});
+      if (PAYLOAD.bare_ref) {
+        entries.push([[ref, 1, null, img.mime], name]);
+        continue;
+      }
+      var pfInner = [[[ref, null, 1, img.mime], name], null, 1, ['zh-CN']];
       var pfParams = new URLSearchParams();
       pfParams.set('f.req', JSON.stringify([null, JSON.stringify(pfInner)]));
       pfParams.set('at', at);
@@ -167,15 +212,21 @@ def _page_chain_js(prompt: str, images: list) -> str:
         body: pfParams.toString()});
       var pfText = await r3.text();
       var um = pfText.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/);
-      if (!um) return JSON.stringify({err: 'ProcessFile failed: ' + pfText.slice(0, 100)});
-      entries.push([[ref, 1, null, img.mime, um[0]], 'image_' + (i + 1) + '.png']);
+      if (!um) {
+        var code = pfText.match(/\\[\\s*([0-9]{1,3})\\s*\\]/);
+        return out({stage: 'process_file', code: code ? Number(code[1]) : null,
+                    err: 'ProcessFile failed: ' + pfText.slice(0, 100)});
+      }
+      entries.push([[ref, 1, null, img.mime, um[0]], name]);
     }
     var inner = new Array(102).fill(null);
     inner[0] = [PAYLOAD.prompt, 0, null, entries, null, null, 0];
     inner[1] = ['zh-CN']; inner[6] = [0]; inner[7] = 1; inner[10] = 1; inner[11] = 0;
-    inner[17] = [[0]]; inner[18] = 0; inner[27] = 1; inner[30] = [4]; inner[41] = [2];
+    inner[17] = [[PAYLOAD.think_mode == null ? 0 : PAYLOAD.think_mode]];
+    inner[18] = 0; inner[27] = 1; inner[30] = [4]; inner[41] = [2];
     inner[53] = 0; inner[59] = 'BRDG' + Date.now().toString(16).toUpperCase() + '-4A01-4C22-9F61A7E89B01';
-    inner[61] = []; inner[68] = 1; inner[79] = 1;
+    inner[61] = []; inner[68] = 1;
+    inner[79] = PAYLOAD.model_id == null ? 1 : PAYLOAD.model_id;
     var params = new URLSearchParams();
     params.set('f.req', JSON.stringify([null, JSON.stringify(inner)]));
     params.set('at', at);
@@ -187,21 +238,124 @@ def _page_chain_js(prompt: str, images: list) -> str:
     var sgText = await r4.text();
     if (sgText.indexOf('BardErrorInfo') >= 0) {
       var em = sgText.match(/BardErrorInfo[^0-9]*(\\d+)/);
-      return JSON.stringify({err: 'upstream rejected: ' + (em ? em[1] : 'unknown')});
+      return out({stage: 'generate', err: 'upstream rejected: ' + (em ? em[1] : 'unknown')});
     }
-    return JSON.stringify({sg: sgText});
+    return out({sg: sgText});
   } catch (e) {
-    return JSON.stringify({err: 'chain exception: ' + String(e).slice(0, 150)});
+    return out({stage: 'exception', err: 'chain exception: ' + String(e).slice(0, 150)});
   }
 })()""" % payload
 
 
-def vision_generate(prompt: str, images: list) -> str:
+def _classify_chain_failure(data: dict) -> str:
+    """Classify one in-page chain failure for the retry policy.
+
+    Args:
+        data: parsed chain result dict with "stage"/"code"/"err" keys.
+
+    Returns:
+        One of "stale_session" (reload + retry), "transient" (retry on a
+        fresh tab), "fatal" (surface the error immediately).
+    """
+    stage = data.get("stage") or ""
+    code = data.get("code")
+    if stage == "process_file" and (code in (7, 8) or "session" in (data.get("err") or "")):
+        return "stale_session"  # documented 2026-09-24 idle-tab expiry
+    if stage in ("upload_start", "upload", "exception"):
+        return "transient"
+    return "fatal"
+
+
+def _run_page_chain(js: str) -> dict:
+    """Execute one chain script on the current Gemini tab.
+
+    Args:
+        js: chain script from _page_chain_js.
+
+    Returns:
+        Parsed result dict ({sg: ...} or {stage/err/code: ...}).
+
+    Raises:
+        VisionBridgeError: when no tab exists or the evaluate fails at
+        the transport level.
+    """
+    try:
+        tab = _find_gemini_tab()
+    except VisionBridgeError:
+        # No Gemini tab (e.g. after a browser restart): open a fresh one
+        # instead of failing - the chain itself reports missing logins.
+        tab = _open_fresh_gemini_tab()
+    raw = _tab_evaluate(tab, js, _BRIDGE_CHAIN_TIMEOUT)
+    if not (isinstance(raw, str) and raw.startswith("{")):
+        raise VisionBridgeError(f"bridge chain returned malformed output: {str(raw)[:80]}")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise VisionBridgeError(f"bridge chain output not JSON: {exc}") from exc
+
+
+def _reload_gemini_tab() -> dict:
+    """Reload the Gemini tab and wait for fresh WIZ_global_data tokens.
+
+    Args:
+        None.
+
+    Returns:
+        Fresh token dict (at/...) when the page mints tokens again; {}
+        when the reloaded page still carries no at (the tab needs a
+        manual Google re-login).
+
+    Raises:
+        VisionBridgeError: on CDP transport failures.
+    """
+    tabs = [t for t in _cdp_http("/json/list")
+            if t.get("type") == "page" and "gemini.google.com" in t.get("url", "")]
+    if not tabs:
+        tabs = [_open_fresh_gemini_tab()]
+    for tab in reversed(tabs):  # newest first
+        try:
+            ws = _tab_ws(tab, 30)
+            try:
+                ws.send(json.dumps({"id": 1, "method": "Page.reload",
+                                    "params": {"ignoreCache": False}}))
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    msg = json.loads(ws.recv())
+                    if msg.get("id") == 1:
+                        break
+            finally:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            log(f"bridge tab reload issue ({exc}); continuing")
+    # Wait for WIZ_global_data to settle back into the fresh document.
+    deadline = time.time() + _BRIDGE_RELOAD_WAIT
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            tab = _find_gemini_tab()
+            tokens = _map_page_tokens(_tab_evaluate(tab, _TOKEN_JS, _BRIDGE_EVAL_TIMEOUT))
+            if tokens.get("at"):
+                log("bridge tab reloaded; fresh session tokens acquired")
+                return tokens
+        except Exception:
+            continue
+    log("bridge tab reload did not restore SNlM0e (manual re-login likely)")
+    return {}
+
+
+def vision_generate(prompt: str, images: list,
+                    model_id: Optional[int] = None, think_mode: Optional[int] = None) -> str:
     """Generate a completion with images through the logged-in browser tab.
 
     Args:
         prompt: user prompt text.
-        images: list of (image_bytes, mime_type) tuples.
+        images: list of (image_bytes, mime_type) tuples; http(s) URL
+            strings are downloaded first.
+        model_id: optional MODE_CATEGORY id forwarded to the page payload.
+        think_mode: optional thinking level forwarded to the page payload.
 
     Returns:
         Raw StreamGenerate response text from the page.
@@ -209,49 +363,57 @@ def vision_generate(prompt: str, images: list) -> str:
     Raises:
         VisionBridgeError: on bridge, session or upstream failure.
     """
-    oversized = [b for b, _ in images if len(b) > MAX_BRIDGE_IMAGE_BYTES]
-    if oversized:
+    from .image_fetch import fetch_image_bytes
+    from .image_prep import prepare_image
+
+    prepared = []
+    for data, mime in images:
+        if isinstance(data, str):  # defensive: URL entries normalize first
+            data = fetch_image_bytes(data)
+            mime = None
+        if not data:
+            raise VisionBridgeError("image fetch failed")
+        data, mime = prepare_image(data, mime or "image/png",
+                                   MAX_BRIDGE_IMAGE_BYTES)
+        if len(data) > MAX_BRIDGE_IMAGE_BYTES:
+            raise VisionBridgeError(
+                f"image exceeds bridge limit of {MAX_BRIDGE_IMAGE_BYTES} bytes")
+        prepared.append((data, mime))
+
+    if not _bridge_lock.acquire(timeout=_BRIDGE_CHAIN_WAIT):
         raise VisionBridgeError(
-            f"image exceeds bridge limit of {MAX_BRIDGE_IMAGE_BYTES} bytes")
+            f"vision bridge busy: queued longer than {_BRIDGE_CHAIN_WAIT:.0f}s")
     try:
-        tab = _find_gemini_tab()
-    except VisionBridgeError:
-        # No Gemini tab (e.g. after a browser restart): open a fresh one
-        # instead of failing - the chain itself reports missing logins.
-        tab = _open_fresh_gemini_tab()
-    ws = _tab_ws(tab, 200)
-    try:
-        js = _page_chain_js(prompt, images)
-        ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
-                            "params": {"expression": js, "awaitPromise": True,
-                                        "returnByValue": True}}))
-        raw = None
-        while True:
-            msg = json.loads(ws.recv())
-            if msg.get("id") == 1:
-                raw = msg
-                break
-        if raw is None or raw.get("error"):
-            raise VisionBridgeError(f"evaluate failed: {raw and raw['error']}")
-        result = raw["result"].get("result", {})
-        if "exceptionDetails" in raw["result"]:
-            raise VisionBridgeError("page exception during vision chain")
-        value = result.get("value")
-        if not value:
-            raise VisionBridgeError("empty bridge result")
-        data = json.loads(value)
-        if data.get("err"):
-            raise VisionBridgeError(f"bridge chain: {data['err']}")
+        js = _page_chain_js(prompt, prepared, model_id, think_mode)
+        data = _run_page_chain(js)
+        verdict = _classify_chain_failure(data) if data.get("err") else None
+        if verdict == "stale_session":
+            log(f"bridge chain stale session ({data.get('err', '')[:60]}); "
+                "reloading tab and retrying once")
+            if _reload_gemini_tab().get("at"):
+                data = _run_page_chain(js)
+        elif verdict == "transient":
+            log(f"bridge chain transient failure ({data.get('err', '')[:60]}); retrying once")
+            data = _run_page_chain(js)
+        if data.get("err") and data.get("stage") == "process_file":
+            # Registration keeps rejecting (e.g. upstream pipeline change):
+            # one attempt with bare references - the form the reference
+            # clients send (HanaokaYuzu/Gemini-API, g4f) when ProcessFile
+            # does not exist in their protocol at all.
+            log("ProcessFile unusable; retrying with bare references (no UUID)")
+            data = _run_page_chain(
+                _page_chain_js(prompt, prepared, model_id, think_mode,
+                               allow_bare_ref=True))
+        err = data.get("err")
+        if err:
+            raise VisionBridgeError(f"bridge chain: {err}")
         sg = data.get("sg")
         if not sg:
             raise VisionBridgeError("bridge chain returned no generation")
         log("vision bridge chain ok (%d bytes)" % len(sg))
         return sg
     finally:
-        try:
-            ws.close()
-        except Exception:
-            pass
+        _bridge_lock.release()
 
 
 # ---------------------------------------------------------------------------

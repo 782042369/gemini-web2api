@@ -136,6 +136,55 @@ def vision_direct_ready() -> bool:
     return bool(tokens.get("at") and tokens.get("push_id"))
 
 
+# ---------------------------------------------------------------------------
+# Direct-chain circuit breaker (research: LiteLLM allowed_fails/cooldown).
+# ---------------------------------------------------------------------------
+# After BREAKER_FAILS consecutive direct vision failures the auto router
+# skips the direct chain entirely for BREAKER_COOLDOWN seconds and goes
+# straight to the CDP bridge, avoiding a doomed upload+generate attempt
+# (and the rate-limit pressure repeated failures cause) on every request.
+
+_BREAKER_FAILS = 3
+_BREAKER_COOLDOWN = 60.0
+_direct_breaker = {"fails": 0, "cool_until": 0.0}
+_direct_breaker_lock = threading.Lock()
+
+
+def note_direct_vision_outcome(ok: bool) -> None:
+    """Record one direct-chain vision outcome for the circuit breaker.
+
+    Args:
+        ok: True when the direct upload+generate attempt succeeded.
+
+    Returns:
+        None.
+    """
+    with _direct_breaker_lock:
+        if ok:
+            _direct_breaker.update(fails=0, cool_until=0.0)
+            return
+        _direct_breaker["fails"] += 1
+        if _direct_breaker["fails"] >= _BREAKER_FAILS:
+            _direct_breaker["cool_until"] = time.monotonic() + _BREAKER_COOLDOWN
+
+
+def vision_direct_available() -> bool:
+    """Report whether the direct chain should be attempted right now.
+
+    Args:
+        None.
+
+    Returns:
+        True when tokens are ready and the circuit breaker is not in its
+        cooldown window (readiness is still checked separately by callers
+        that need the raw token state).
+    """
+    if not vision_direct_ready():
+        return False
+    with _direct_breaker_lock:
+        return time.monotonic() >= _direct_breaker["cool_until"]
+
+
 _page_tokens_cache = {}  # (cookie path, auth_user) -> tokens, freshness, lock
 _page_tokens_lock = threading.RLock()
 
