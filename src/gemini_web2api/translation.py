@@ -18,6 +18,7 @@ def parse_numbered_translations(text, count):
         return {}
     blocks = {}
     duplicates = set()
+    predecessors = {}
     current = None
     lines = []
 
@@ -36,12 +37,21 @@ def parse_numbered_translations(text, count):
             index = int(marker.group(1))
             if not 0 <= index < count:
                 return {}
+            predecessors.setdefault(index, set()).add(current)
             current = index
             lines = [marker.group(2)]
         elif current is not None:
             lines.append(line)
     store()
-    return {index: value for index, value in blocks.items() if value and index not in duplicates}
+    # A duplicate marker may be body text that truncated its predecessor.
+    # Retry both sides of ambiguous boundaries, not just the duplicate.
+    ambiguous = duplicates | {i for duplicate in duplicates for i in predecessors[duplicate]}
+    return {index: value for index, value in blocks.items() if value and index not in ambiguous}
+
+
+def has_numbered_body(text):
+    """Detect source lines that collide with batch markers. Args: text. Returns: bool."""
+    return any(re.match(r'^[ \t]*\[\d+\]', line) for line in text.splitlines())
 
 
 def require_translation(text):
@@ -85,6 +95,13 @@ def split_translation_batches(segments, max_segments, max_chars, overhead_chars=
     for segment in segments:
         if not isinstance(segment, str):
             raise ValueError("translation segments must be strings")
+        if has_numbered_body(segment):
+            if batch:
+                result.append(batch)
+                batch = []
+            result.append([segment])
+            used = overhead_chars
+            continue
         cost = len(segment) + len(str(len(batch))) + 4
         if batch and (len(batch) >= max_segments or used + cost > max_chars):
             result.append(batch)

@@ -30,10 +30,20 @@ import socket
 import threading
 import time
 import urllib.request
+import uuid
 from typing import Optional
 
+from .budget import (
+    RequestBudget,
+    RequestControlError,
+    budget_lock,
+    budget_scope,
+    check_budget,
+    remaining_timeout,
+)
 from .config import CONFIG
 from .logs import log
+from .vision_control import bridge_sleep, parallel_uploads, receive_cdp, request_scoped
 
 # One browser tab executes one chain at a time; the page-level tokens are
 # session-scoped and concurrent evaluates would interleave.
@@ -85,6 +95,8 @@ def _bridge_endpoint() -> tuple:
     host = parsed.hostname or "127.0.0.1"
     try:
         host = socket.gethostbyname(host)
+    except RequestControlError:
+        raise
     except Exception:
         pass
     port = parsed.port or 80
@@ -104,12 +116,17 @@ def _cdp_http(path: str, timeout: float = 10) -> object:
     Raises:
         VisionBridgeError: on connection or parsing failure.
     """
+    check_budget("vision CDP connect")
     base = _bridge_endpoint()[0]
     try:
-        with urllib.request.urlopen(base + path, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
+        with urllib.request.urlopen(base + path, timeout=remaining_timeout(timeout, "vision CDP HTTP")) as resp:
+            from .upstream.transport import read_urllib_response
+            return json.loads(read_urllib_response(resp, 'vision CDP HTTP').decode())
+    except RequestControlError:
+        raise
     except Exception as exc:
-        raise VisionBridgeError(f"vision bridge unreachable: {exc}") from exc
+        check_budget('vision CDP HTTP')
+        raise VisionBridgeError(f'vision bridge unreachable: {exc}') from exc
 
 
 def _find_gemini_tab() -> dict:
@@ -161,6 +178,7 @@ def _page_chain_js(prompt: str, images: list,
     """
     parts = []
     for data, mime in images:
+        check_budget("vision image preparation")
         if isinstance(data, str):  # pre-uploaded file reference (hybrid)
             parts.append({"ref": data, "mime": mime})
         else:
@@ -296,21 +314,42 @@ def _run_page_chain(js: str) -> dict:
         VisionBridgeError: when no tab exists or the evaluate fails at
         the transport level.
     """
+    check_budget('vision page chain')
     try:
         tab = _find_gemini_tab()
     except VisionBridgeError:
-        # No Gemini tab (e.g. after a browser restart): open a fresh one
-        # instead of failing - the chain itself reports missing logins.
+        check_budget('vision tab recovery')
         tab = _open_fresh_gemini_tab()
-    raw = _tab_evaluate(tab, js, _BRIDGE_CHAIN_TIMEOUT)
-    if not (isinstance(raw, str) and raw.startswith("{")):
-        raise VisionBridgeError(f"bridge chain returned malformed output: {str(raw)[:80]}")
+    timeout = remaining_timeout(_BRIDGE_CHAIN_TIMEOUT, 'vision page chain')
+    key = 'geminiBridge_' + uuid.uuid4().hex
+    expression = (
+        '(async function(){const controller=new AbortController();'
+        f'const key={json.dumps(key)};globalThis[key]=controller;'
+        f'const timer=setTimeout(()=>controller.abort(),{max(1, int(timeout * 1000))});'
+        'const fetch=(url,options)=>globalThis.fetch(url,{...options,signal:controller.signal});'
+        f'try{{return await {js};}}finally{{clearTimeout(timer);delete globalThis[key];}}'
+        '})()'
+    )
+    try:
+        raw = _tab_evaluate(tab, expression, timeout)
+    except BaseException:
+        # Best effort and bounded: abort only this chain, never another tab task.
+        with budget_scope(RequestBudget(seconds=0.1)):
+            try:
+                _tab_evaluate(tab, f'globalThis[{json.dumps(key)}]?.abort()', 0.1)
+            except Exception:
+                pass
+        raise
+    check_budget('vision page chain completion')
+    if not (isinstance(raw, str) and raw.startswith('{')):
+        raise VisionBridgeError('bridge chain returned malformed output')
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise VisionBridgeError(f"bridge chain output not JSON: {exc}") from exc
+        raise VisionBridgeError(f'bridge chain output not JSON: {exc}') from exc
 
 
+@request_scoped
 def _reload_gemini_tab() -> dict:
     """Reload the Gemini tab and wait for fresh WIZ_global_data tokens.
 
@@ -335,28 +374,28 @@ def _reload_gemini_tab() -> dict:
             try:
                 ws.send(json.dumps({"id": 1, "method": "Page.reload",
                                     "params": {"ignoreCache": False}}))
-                deadline = time.time() + 10
-                while time.time() < deadline:
-                    msg = json.loads(ws.recv())
-                    if msg.get("id") == 1:
-                        break
+                receive_cdp(ws, 1, time.monotonic() + 10)
             finally:
                 try:
-                    ws.close()
+                    ws.close(timeout=0)
                 except Exception:
                     pass
+        except RequestControlError:
+            raise
         except Exception as exc:
             log(f"bridge tab reload issue ({exc}); continuing")
     # Wait for WIZ_global_data to settle back into the fresh document.
-    deadline = time.time() + _BRIDGE_RELOAD_WAIT
-    while time.time() < deadline:
-        time.sleep(3)
+    deadline = time.monotonic() + _BRIDGE_RELOAD_WAIT
+    while time.monotonic() < deadline:
+        bridge_sleep(3)
         try:
             tab = _find_gemini_tab()
             tokens = _map_page_tokens(_tab_evaluate(tab, _TOKEN_JS, _BRIDGE_EVAL_TIMEOUT))
             if tokens.get("at"):
                 log("bridge tab reloaded; fresh session tokens acquired")
                 return tokens
+        except RequestControlError:
+            raise
         except Exception:
             continue
     log("bridge tab reload did not restore SNlM0e (manual re-login likely)")
@@ -380,6 +419,7 @@ def _hybrid_byte_cap() -> int:
     return value
 
 
+@request_scoped
 def _server_upload_all(prepared: list) -> list:
     """Upload every prepared image server-side for the hybrid chain.
 
@@ -396,25 +436,23 @@ def _server_upload_all(prepared: list) -> list:
         when any image cannot be uploaded (caller falls back to the
         in-page base64 chain).
     """
+    from .server.images import _upload_one
+    check_budget('vision uploads')
+    if not prepared:
+        return []
     try:
-        from concurrent.futures import ThreadPoolExecutor
-        from .server.images import _upload_one
-        # Parallel uploads (research: HanaokaYuzu asyncio.gather): the
-        # Scotty endpoints are independent per file; multi-image requests
-        # upload concurrently instead of serially.
         if len(prepared) > 1:
-            with ThreadPoolExecutor(max_workers=min(4, len(prepared))) as pool:
-                refs = list(pool.map(
-                    lambda dm: (str(_upload_one(*dm)), dm[1]), prepared))
-        else:
-            refs = [(str(_upload_one(*prepared[0])), prepared[0][1])]
-        return refs
+            return parallel_uploads(prepared, _upload_one)
+        return [(str(_upload_one(*prepared[0])), prepared[0][1])]
+    except RequestControlError:
+        raise
     except Exception as e:
-        log(f"server-side upload for hybrid bridge chain failed ({e}); "
-            "falling back to in-page upload")
+        check_budget('vision uploads')
+        log(f'server-side upload failed ({e}); falling back to in-page upload')
         return None
 
 
+@request_scoped
 def vision_generate(prompt: str, images: list,
                     model_id: Optional[int] = None, think_mode: Optional[int] = None) -> str:
     """Generate a completion with images through the logged-in browser tab.
@@ -437,6 +475,7 @@ def vision_generate(prompt: str, images: list,
 
     prepared = []
     for data, mime in images:
+        check_budget("vision image preparation")
         if isinstance(data, str):  # defensive: URL entries normalize first
             data = fetch_image_bytes(data)
             mime = None
@@ -450,10 +489,16 @@ def vision_generate(prompt: str, images: list,
                 f"image exceeds limit of {_hybrid_byte_cap()} bytes")
         prepared.append((data, mime))
 
-    if not _bridge_lock.acquire(timeout=_BRIDGE_CHAIN_WAIT):
-        raise VisionBridgeError(
-            f"vision bridge busy: queued longer than {_BRIDGE_CHAIN_WAIT:.0f}s")
+    queue_end = time.monotonic() + _BRIDGE_CHAIN_WAIT
+    while True:
+        check_budget('vision bridge queue')
+        left = queue_end - time.monotonic()
+        if left <= 0:
+            raise VisionBridgeError(f'vision bridge busy: queued longer than {_BRIDGE_CHAIN_WAIT:.0f}s')
+        if _bridge_lock.acquire(timeout=min(0.1, remaining_timeout(left, 'vision bridge queue'))):
+            break
     try:
+        check_budget("vision bridge acquired")
         chain_images = prepared
         if CONFIG.get("vision_bridge_server_upload") is not False:
             refs = _server_upload_all(prepared)
@@ -464,6 +509,7 @@ def vision_generate(prompt: str, images: list,
                 # payload; re-fit anything the looser hybrid budget allowed.
                 chain_images = []
                 for data, mime in prepared:
+                    check_budget("vision fallback preparation")
                     data, mime = prepare_image(data, mime,
                                                MAX_BRIDGE_IMAGE_BYTES)
                     if len(data) > MAX_BRIDGE_IMAGE_BYTES:
@@ -473,15 +519,20 @@ def vision_generate(prompt: str, images: list,
                     chain_images.append((data, mime))
         js = _page_chain_js(prompt, chain_images, model_id, think_mode)
         data = _run_page_chain(js)
+        check_budget("vision generation completion")
         verdict = _classify_chain_failure(data) if data.get("err") else None
         if verdict == "stale_session":
             log(f"bridge chain stale session ({data.get('err', '')[:60]}); "
                 "reloading tab and retrying once")
             if _reload_gemini_tab().get("at"):
+                check_budget("vision reload retry")
                 data = _run_page_chain(js)
+                check_budget("vision reload completion")
         elif verdict == "transient":
             log(f"bridge chain transient failure ({data.get('err', '')[:60]}); retrying once")
+            check_budget("vision transient retry")
             data = _run_page_chain(js)
+            check_budget("vision transient completion")
         if data.get("err") and data.get("stage") == "process_file":
             # Registration keeps rejecting (e.g. upstream pipeline change):
             # one attempt with bare references - the form the reference
@@ -491,6 +542,7 @@ def vision_generate(prompt: str, images: list,
             data = _run_page_chain(
                 _page_chain_js(prompt, chain_images, model_id, think_mode,
                                allow_bare_ref=True))
+        check_budget("vision fallback completion")
         err = data.get("err")
         if err:
             raise VisionBridgeError(f"bridge chain: {err}")
@@ -554,7 +606,7 @@ def _tab_ws(tab: dict, timeout: float):
     ws_url = tab["webSocketDebuggerUrl"]
     wp = urlparse(ws_url)
     ws_url = ws_url.replace(f"{wp.hostname}:{wp.port or 9222}", f"{host}:{port}", 1)
-    return websocket.create_connection(ws_url, timeout=timeout, suppress_origin=True)
+    return websocket.create_connection(ws_url, timeout=remaining_timeout(timeout, "vision CDP connect"), suppress_origin=True)
 
 
 def _tab_evaluate(tab: dict, js: str, timeout: float):
@@ -571,23 +623,21 @@ def _tab_evaluate(tab: dict, js: str, timeout: float):
     Raises:
         Exception: transport/timeout errors (caller treats as wedge).
     """
-    ws = _tab_ws(tab, timeout)
+    deadline = time.monotonic() + remaining_timeout(timeout, 'vision evaluate')
+    ws = _tab_ws(tab, remaining_timeout(timeout, 'vision evaluate'))
     try:
-        ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
-                            "params": {"expression": js, "awaitPromise": True,
-                                        "returnByValue": True}}))
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = json.loads(ws.recv())
-            if msg.get("id") == 1:
-                result = msg.get("result", {})
-                if "exceptionDetails" in result:
-                    raise VisionBridgeError("token evaluate raised in page")
-                return result.get("result", {}).get("value")
-        raise TimeoutError(f"evaluate on {tab.get('targetId', '?')} timed out")
+        ws.settimeout(remaining_timeout(max(0.001, deadline - time.monotonic()), 'vision evaluate send'))
+        ws.send(json.dumps({'id': 1, 'method': 'Runtime.evaluate',
+                            'params': {'expression': js, 'awaitPromise': True,
+                                       'returnByValue': True}}))
+        msg = receive_cdp(ws, 1, deadline)
+        result = msg.get('result', {})
+        if 'exceptionDetails' in result or 'error' in msg:
+            raise VisionBridgeError('evaluate raised in page')
+        return result.get('result', {}).get('value')
     finally:
         try:
-            ws.close()
+            ws.close(timeout=0)
         except Exception:
             pass
 
@@ -606,22 +656,27 @@ def _close_tabs(target_ids: list) -> None:
     try:
         ver = _cdp_http("/json/version")
         ws = _tab_ws({"webSocketDebuggerUrl": ver["webSocketDebuggerUrl"]}, 15)
+    except RequestControlError:
+        raise
     except Exception:
         return
     try:
         for i, tid in enumerate(target_ids):
             ws.send(json.dumps({"id": i + 1, "method": "Target.closeTarget",
                                 "params": {"targetId": tid}}))
-            time.sleep(0.2)
+            bridge_sleep(0.2)
+    except RequestControlError:
+        raise
     except Exception:
         pass
     finally:
         try:
-            ws.close()
+            ws.close(timeout=0)
         except Exception:
             pass
 
 
+@request_scoped
 def _open_fresh_gemini_tab() -> dict:
     """Create a new tab and navigate it to the Gemini app page.
 
@@ -640,17 +695,13 @@ def _open_fresh_gemini_tab() -> dict:
     try:
         ws.send(json.dumps({"id": 1, "method": "Target.createTarget",
                             "params": {"url": "about:blank"}}))
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            msg = json.loads(ws.recv())
-            if msg.get("id") == 1:
-                target_id = msg.get("result", {}).get("targetId")
-                break
+        msg = receive_cdp(ws, 1, time.monotonic() + 20)
+        target_id = msg.get("result", {}).get("targetId")
         if not target_id:
             raise VisionBridgeError("Target.createTarget returned no id")
     finally:
         try:
-            ws.close()
+            ws.close(timeout=0)
         except Exception:
             pass
     for tab in _cdp_http("/json/list"):
@@ -660,14 +711,14 @@ def _open_fresh_gemini_tab() -> dict:
                           " && location.assign('https://gemini.google.com/app')",
                           _BRIDGE_EVAL_TIMEOUT)
             break
-    deadline = time.time() + 25
-    while time.time() < deadline:
+    deadline = time.monotonic() + 25
+    while time.monotonic() < deadline:
         for tab in _cdp_http("/json/list"):
             if (tab.get("id") == target_id and tab.get("type") == "page"
                     and "gemini.google.com" in tab.get("url", "")):
-                time.sleep(3)  # let WIZ_global_data settle
+                bridge_sleep(3)  # let WIZ_global_data settle
                 return tab
-        time.sleep(1)
+        bridge_sleep(1)
     raise VisionBridgeError("fresh Gemini tab did not navigate")
 
 
@@ -707,6 +758,8 @@ def _fetch_page_tokens_now() -> dict:
     for tab in reversed(tabs):  # newest first: old tabs are wedged corpses
         try:
             raw = _tab_evaluate(tab, _TOKEN_JS, _BRIDGE_EVAL_TIMEOUT)
+        except RequestControlError:
+            raise
         except Exception:
             wedged.append(tab.get("id"))
             continue
@@ -722,6 +775,7 @@ def _fetch_page_tokens_now() -> dict:
         _tab_evaluate(_open_fresh_gemini_tab(), _TOKEN_JS, _BRIDGE_EVAL_TIMEOUT))
 
 
+@request_scoped
 def fetch_page_tokens(force: bool = False) -> dict:
     """Return cached-or-fresh Gemini page tokens from the CDP browser.
 
@@ -735,7 +789,7 @@ def fetch_page_tokens(force: bool = False) -> dict:
     """
     if not vision_bridge_enabled():
         return {}
-    with _bridge_token_lock:
+    with budget_lock(_bridge_token_lock, "vision token cache"):
         now = time.monotonic()
         if not force:
             if (_bridge_token_state["tokens"]
@@ -746,8 +800,11 @@ def fetch_page_tokens(force: bool = False) -> dict:
                 return {}
         try:
             tokens = _fetch_page_tokens_now()
+        except RequestControlError:
+            raise
         except Exception as e:
-            log(f"bridge token fetch failed: {e}")
+            check_budget('vision token fetch')
+            log(f'bridge token fetch failed: {e}')
             tokens = {}
         if tokens.get("at"):
             _bridge_token_state.update(tokens=tokens, ts=time.monotonic(),

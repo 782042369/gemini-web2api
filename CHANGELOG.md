@@ -6,6 +6,15 @@ semver.
 
 ## [Unreleased]
 
+### Translation isolation and vision request controls
+
+- Remove query values from non-POST access logs, including parser errors; retain method, safe path and status.
+- Translate source paragraphs with line-leading numeric references individually. Duplicate output markers also invalidate potentially truncated predecessor blocks.
+- Deliver successful microbatch members before per-item fallbacks; isolate fallback errors and use each caller's original deadline. Expired members do not start new fallback work.
+- Carry request budgets through browser queueing, token lookup, CDP waits, page reloads and parallel uploads. Control failures do not trigger rescue/retry; in-page fetches have an abort timer and bounded targeted cancellation.
+- Preserve selected account/auth-user in upload workers; scope reference-cache digests to account, session, media type and image bytes.
+- Add offline mock and loopback regressions. Repository changes only: no production deployment or live Google verification performed.
+
 ### Vision pipeline research pass (2026-09-24)
 
 Full research report and rationale: docs/VISION_RESEARCH.md (reverse-engineered Gemini projects x LLM-gateway image-pipeline practices).

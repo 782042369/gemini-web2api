@@ -68,10 +68,17 @@ class BaseAPIHandler(BaseHTTPRequestHandler):
             return
         # Health probes (GET / and favicon) poll every few minutes from
         # monitors; logging each one just dilutes the business signal.
-        if self.command == "GET" and self.path in ("/", "/healthz", "/favicon.ico"):
+        command = getattr(self, 'command', None) or '-'
+        path = getattr(self, 'path', '').split('?', 1)[0].split('#', 1)[0]
+        if command == 'GET' and path in ('/', '/healthz', '/favicon.ico'):
             return
-        client_ip = self.client_address[0] if self.client_address else "-"
-        log(f"{client_ip} {fmt % args}")
+        client_ip = self.client_address[0] if self.client_address else '-'
+        # Never format the original requestline or parser error: both may
+        # contain query credentials, even on failed or malformed requests.
+        status = str(args[1]) if fmt == '"%s" %s %s' and len(args) > 1 else '-'
+        status = status if status.isdigit() else '-'
+        safe_line = json.dumps(f'{command} {path}', ensure_ascii=True)
+        log(f'{client_ip} {safe_line} {status}')
 
     def _begin_request(self):
         """Bind a correlation id to this worker thread and note the start.

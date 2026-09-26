@@ -1,5 +1,6 @@
 """Image upload helper shared by every API protocol handler."""
 import hashlib
+import json
 import threading
 import time
 from typing import Optional
@@ -8,6 +9,7 @@ from ..budget import RequestControlError, check_budget
 from ..config import CONFIG
 from ..image_prep import prepare_image
 from ..multimodal import detect_image_mime, fetch_image_bytes, upload_image
+from ..upstream.cookies import _active_auth_user, _active_cookie_path, load_cookie
 
 
 class UploadedFileRef(str):
@@ -102,17 +104,25 @@ _ref_cache = {}
 _ref_cache_lock = threading.Lock()
 
 
-def _cache_key(data: bytes) -> str:
-    """Hash image bytes into a cache key.
+def _cache_key(data: bytes, mime: str = '') -> str:
+    """Hash account, session and image identity; never retain credentials in keys.
 
     Args:
-        data: raw image bytes.
-
+        data: Prepared image bytes.
+        mime: Media type used by the upload.
     Returns:
-        SHA-256 hex digest string.
+        Opaque digest scoped to the selected account and current session.
     """
-    return hashlib.sha256(data).hexdigest()
-
+    from ..vision_bridge import _bridge_token_state
+    check_budget('image cache lookup')
+    cookie, sapisid = load_cookie()
+    bridge = _bridge_token_state.get('tokens') or {}
+    identity = [_active_cookie_path(), _active_auth_user(), cookie, sapisid,
+                CONFIG.get('vision_bridge_url'), mime,
+                [bridge.get(k) for k in ('at', 'push_id', 'f_sid')]]
+    digest = hashlib.sha256(json.dumps(identity, ensure_ascii=True).encode())
+    digest.update(data)
+    return digest.hexdigest()
 
 def _cache_get(key: str):
     """Look up a cached upload reference.
@@ -178,7 +188,8 @@ def _upload_one(data: bytes, mime: str):
     Raises:
         RuntimeError: on upload failure.
     """
-    key = _cache_key(data)
+    check_budget('image upload')
+    key = _cache_key(data, mime or 'image/png')
     cached = _cache_get(key)
     if cached:
         return cached[0]
@@ -186,7 +197,10 @@ def _upload_one(data: bytes, mime: str):
     ref = upload_image(data, f"image.{ext}", mime or "image/png")
     check_budget("image upload")
     file_ref = UploadedFileRef(ref, mime or "image/png")
-    _cache_put(key, ref, mime or "image/png")
+    # Token acquisition or cookie renewal may change identity during upload;
+    # a conservative cache miss is safer than publishing under another session.
+    if key == _cache_key(data, mime or 'image/png'):
+        _cache_put(key, ref, mime or 'image/png')
     return file_ref
 
 

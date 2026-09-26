@@ -112,8 +112,11 @@ def _merge_bridge_tokens(tokens: dict) -> dict:
         try:
             from .vision_bridge import fetch_page_tokens
             bridge = fetch_page_tokens()
+        except RequestControlError:
+            raise
         except Exception as e:
-            log(f"bridge token fallback unavailable: {e}")
+            check_budget('vision token merge')
+            log(f'bridge token fallback unavailable: {e}')
             bridge = {}
         for key, value in bridge.items():
             if value and not tokens.get(key):

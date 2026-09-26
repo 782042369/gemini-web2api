@@ -18,7 +18,12 @@ from .budget import (
 )
 from .config import CONFIG
 from .logs import get_request_id, log
-from .translation import parse_numbered_translations, require_translation, split_translation_batches
+from .translation import (
+    has_numbered_body,
+    parse_numbered_translations,
+    require_translation,
+    split_translation_batches,
+)
 from .upstream import generate
 from .upstream.concurrency import max_queued_requests
 from .upstream.cookies import _active_auth_user, _active_cookie_path, set_active_auth_user, use_cookie
@@ -197,7 +202,12 @@ class _MicroBatcher:
             try:
                 with budget_scope(shared), use_cookie(entries[0].get("cookie_path")):
                     set_active_auth_user(entries[0].get("auth_user"))
-                    results = entries[0]["runner"](prompts)
+                    runner = entries[0]['runner']
+                    run_entries = getattr(runner, '__dict__', {}).get('run_entries')
+                    if callable(run_entries):
+                        run_entries(entries)
+                        continue
+                    results = runner(prompts)
                     shared.check("translation batch completion")
                 if not isinstance(results, list) or len(results) != len(prompts):
                     raise RuntimeError("microbatch: runner length mismatch")
@@ -213,8 +223,10 @@ class _MicroBatcher:
 
 def _finish_entry(entry, result=None, error=None):
     """Wake a waiter, including pre-dispatch failures. Args: entry, result, error. Returns: None."""
-    holder = entry["holder"]
-    holder["result"], holder["error"] = result, error
+    holder = entry['holder']
+    if holder['event'].is_set():
+        return
+    holder['result'], holder['error'] = result, error
     if holder.get("started") is not None:
         holder["started"].set()
     holder["event"].set()
@@ -310,45 +322,56 @@ def _microbatch_runner(model_id, think_mode, extra_fields, instruction=""):
     prefix = f"{instruction}\n" if instruction else ""
 
     def _direct(prompt):
-        """Run a segment within the shared budget. Args: prompt. Returns: non-empty text."""
-        check_budget("translation fallback")
-        return require_translation(generate(f"{prefix}{prompt}", model_id, think_mode, None, extra_fields))
+        """Translate under the active budget. Args: prompt. Returns: non-empty text."""
+        check_budget('translation fallback')
+        result = require_translation(generate(f'{prefix}{prompt}', model_id, think_mode, None, extra_fields))
+        check_budget('translation fallback completion')
+        return result
 
-    def _execute(prompts):
-        """Execute a group under its caller budget. Args: prompts. Returns: aligned texts."""
-        check_budget("translation generation")
-        if len(prompts) == 1:
-            return [_direct(prompts[0])]
-        body = "\n".join(f"[{i}] {s}" for i, s in enumerate(prompts))
+    def _packed(prompts):
+        """Generate once; never fan out infrastructure errors. Args: prompts. Returns: index map."""
+        check_budget('translation generation')
+        body = '\n'.join(f'[{i}] {s}' for i, s in enumerate(prompts))
         packed = (
-            f"{prefix}"
-            f"以下 {len(prompts)} 个编号任务互相独立。逐个执行，输出要求:\n"
-            "- 每个任务的结果以 [编号] 行开始，到下一个编号行为止\n"
-            "- 除各任务结果外不输出任何解释或额外内容\n\n"
-            f"{body}"
+            f'{prefix}以下 {len(prompts)} 个编号任务互相独立。逐个执行，输出要求:\n'
+            '- 每个任务的结果以 [编号] 行开始，到下一个编号行为止\n'
+            '- 除各任务结果外不输出任何解释或额外内容\n\n'
+            f'{body}'
         )
-        parsed = {}
-        try:
-            out = generate(packed, model_id, think_mode, None, extra_fields)
-            parsed = parse_numbered_translations(out, len(prompts))
-        except Exception as e:
-            # generate already exhausted its classified retry policy. Replaying
-            # as individual segments would bypass Retry-After and amplify load.
-            log(f"Microbatch upstream error: {type(e).__name__}")
-            raise
-        results = []
-        for i, prompt in enumerate(prompts):
-            if parsed.get(i):
-                results.append(parsed[i])
-            else:
-                results.append(_direct(prompt))
-        return results
+        out = generate(packed, model_id, think_mode, None, extra_fields)
+        check_budget('translation batch completion')
+        return parse_numbered_translations(out, len(prompts))
 
     def _run(prompts):
-        """Preserve one budget across batch and fallbacks. Args: prompts. Returns: texts."""
+        """Preserve the standalone runner contract. Args: prompts. Returns: aligned texts."""
         with budget_scope():
-            return _execute(prompts)
+            if len(prompts) == 1 or any(has_numbered_body(p) for p in prompts):
+                return [_direct(prompt) for prompt in prompts]
+            parsed = _packed(prompts)
+            return [parsed[i] if i in parsed else _direct(prompt) for i, prompt in enumerate(prompts)]
 
+    def _run_entries(entries):
+        """Deliver independent callers before fallbacks. Args: entries. Returns: None."""
+        prompts = [entry['prompt'] for entry in entries]
+        parsed = {}
+        if len(prompts) > 1 and not any(has_numbered_body(p) for p in prompts):
+            parsed = _packed(prompts)
+        for i, result in parsed.items():
+            entry = entries[i]
+            if _entry_active(entry):
+                _finish_entry(entry, result=result)
+        for entry in entries:
+            if entry['holder']['event'].is_set() or not _entry_active(entry):
+                continue
+            try:
+                with budget_scope(entry.get('budget')):
+                    result = _direct(entry['prompt'])
+                if _entry_active(entry):
+                    _finish_entry(entry, result=result)
+            except Exception as exc:
+                _finish_entry(entry, error=exc)
+
+    _run.run_entries = _run_entries
     _run.overhead_chars = len(prefix) + 512
     return _run
 

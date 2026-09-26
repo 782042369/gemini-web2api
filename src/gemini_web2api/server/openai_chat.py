@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 
+from ..budget import RequestControlError, check_budget
 from ..config import CONFIG
 from ..logs import log
 from ..models import resolve_model
@@ -69,8 +70,10 @@ class OpenAIChatMixin:
                 return False, VisionBridgeError(
                     "vision bridge tab is not logged in (no SNlM0e in page) - "
                     "re-login the Google account on the CDP browser desktop")
+        except RequestControlError:
+            raise
         except Exception:
-            pass  # unreachable bridge: let the chain surface the real error
+            check_budget('vision preflight')
         try:
             # Global byte cap: the hybrid bridge chain uploads server-side
             # (no 4 MiB CDP limit); vision_generate re-fits to the bridge
@@ -79,7 +82,10 @@ class OpenAIChatMixin:
             sg_raw = vision_generate(prompt, prepared,
                                      model_id=model_id, think_mode=think_mode)
             text = extract_response_text(sg_raw)
+        except RequestControlError:
+            raise
         except Exception as e:
+            check_budget('vision generation')
             return False, e
         if not text:
             return False, VisionBridgeError("vision bridge produced empty text")
