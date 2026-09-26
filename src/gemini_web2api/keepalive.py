@@ -179,15 +179,18 @@ _vision_tab_last = {"ts": 0.0}
 
 
 def _maybe_keep_vision_tab():
-    """Reload the CDP Gemini tab on a config-gated schedule.
+    """Keep the CDP Gemini tab's session fresh, soft activity first.
 
     Root cause of the 2026-09-24 vision outage: an idle tab let the
     page-level at token expire (ProcessFile error 7) and after a manual
-    reload Google stopped serving SNlM0e until re-login. A periodic
-    reload keeps DBSC rotation and the at token fresh through idle
-    periods. Disabled unless CONFIG["vision_tab_keepalive_sec"] > 0
-    (each reload also re-warms the borrowed-token cache). Runs inside
-    the keepalive loop, so it requires keepalive_sec > 0 as well.
+    reload Google stopped serving SNlM0e until re-login. Research
+    (HanaokaYuzu _sync_activity; CSA 2026-08) favors soft activity over
+    reloads because a reload can itself trigger the SNlM0e stop. So this
+    ring probes the page tokens first: a tab still minting at needs
+    nothing (its own signaler keeps rotating DBSC); only a tab whose at
+    is missing gets one reload. Disabled unless
+    CONFIG["vision_tab_keepalive_sec"] > 0. Runs inside the keepalive
+    loop, so it requires keepalive_sec > 0 as well.
 
     Args:
         None.
@@ -208,6 +211,10 @@ def _maybe_keep_vision_tab():
     try:
         from . import vision_bridge
         if not vision_bridge.vision_bridge_enabled():
+            return
+        tokens = vision_bridge.fetch_page_tokens(force=True)
+        if tokens.get("at"):
+            log("vision tab keepalive: at fresh (soft probe, no reload)")
             return
         tokens = vision_bridge._reload_gemini_tab()
         if tokens.get("at"):

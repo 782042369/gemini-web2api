@@ -79,6 +79,13 @@ DEFAULT_CONFIG = {
     # enable only with an explicit ops decision (each reload minted fresh
     # tokens; a logged-out tab stays logged out and only logs a warning).
     "vision_tab_keepalive_sec": 0,
+    # Hybrid bridge chain: upload images server-side (browser session with
+    # the push_id borrowed from the CDP page) and run only ProcessFile +
+    # StreamGenerate inside the page. Removes the 4 MiB CDP evaluate
+    # payload limit and shrinks the in-page script to plain reference
+    # strings; any server-upload failure falls back to the in-page
+    # base64 upload chain unchanged.
+    "vision_bridge_server_upload": True,
 }
 
 # Known key types for validation: "int", "float", "str", "bool", "list".
@@ -97,6 +104,7 @@ _TYPED_KEYS = {
     "log_file": "str", "log_retention_days": "int",
     "max_request_body_bytes": "int", "max_image_bytes": "int",
     "vision_max_edge_px": "int", "vision_tab_keepalive_sec": "int",
+    "vision_bridge_server_upload": "bool",
     "request_body_timeout_sec": "int", "allow_private_image_urls": "bool",
     "log_requests": "bool", "temporary_chats": "bool",
     "auto_delete_history": "bool",

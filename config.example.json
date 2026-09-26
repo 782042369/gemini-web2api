@@ -40,5 +40,6 @@
   "request_body_timeout_sec": 30,
   "allow_private_image_urls": false,
   "vision_max_edge_px": 2048,
-  "vision_tab_keepalive_sec": 0
+  "vision_tab_keepalive_sec": 0,
+  "vision_bridge_server_upload": true
 }

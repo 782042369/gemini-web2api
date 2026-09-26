@@ -77,6 +77,32 @@
 
 - 生产容器仍需重建镜像后才吃到以上改动（Pillow 新依赖 + 代码）。
 - vision_tab_keepalive_sec 默认关闭；启用即对应 KEY.md 中 2026-09-24
-  「防复发组合 B」提议，需人工拍板后改 config.json。
+  「防复发组合 B」提议，需人工拍板后改 config.json（第二轮已改为软保活优先：
+  at 新鲜只探测不 reload，at 缺失才 reload）。
+
+## 五、第二轮调研与优化（2026-09-25）
+
+第二轮全网检索（HanaokaYuzu/Gemini-API 源码逐行核实、zhu327/gemini-openai-proxy、
+new-api 兼容层、官方 files API 对照、DBSC 社区共识）确认：上一轮 13 项中裸 ref 降级、
+RotateCookies、入口规范化、熔断等已覆盖社区最佳实践；本轮补齐四项新差距：
+
+| # | 优化 | 模块 | 依据 |
+|---|---|---|---|
+| 14 | **混合桥链**：图片改在服务端浏览器会话上传（push_id 从 CDP 页面借出），
+页面内只跑 ProcessFile + StreamGenerate——CDP evaluate 载荷从 base64 图像字节缩为
+纯 ref 字符串，解除 4MiB evaluate 上限（图像按全局 20MiB 上限）；服务端上传失败
+自动回落页内 base64 链（回落后自动重压回 4MiB） | vision_bridge.py
+（vision_bridge_server_upload 配置，默认开） | HanaokaYuzu：上传端点不依赖 at，仅 SG 需要 |
+| 15 | 服务端上传文件名带正确扩展名（此前固定 image.png，JPEG 误报 .png）
+| server/images.py _MIME_EXT | g4f #3064（上轮已知但直连链漏改） |
+| 16 | **软保活优先的标签页保活环**：探测页面 at 仍新鲜则只做软探测不 reload
+（页面自带 signaler 会续转 DBSC）；仅 at 缺失才 reload——规避 09-24 实测的
+reload 后 Google 停发 SNlM0e 风险 | keepalive.py _maybe_keep_vision_tab |
+HanaokaYuzu _sync_activity、CSA 2026-08 |
+| 17 | **多图并发上传**：hybrid 链多图请求并行上传（≤4 并发），对齐 HanaokaYuzu
+asyncio.gather | vision_bridge.py _server_upload_all | HanaokaYuzu client.py:1209 |
+
+测试：825 项离线测试全绿（新增 5 项：ref payload、hybrid 成功/回落/配置关闭、
+上传扩展名；改写保活环测试为软优先语义）。
 - 三次断链的另两项防复发（A：CDP Chrome+socat 纳入 seat supervisor；C：at 缺失
   告警）属宿主机/监控层变更，不在本仓库代码范围。

@@ -153,12 +153,24 @@ def _cache_put(key: str, ref: str, mime: str) -> None:
             _ref_cache.pop(next(iter(_ref_cache)))
 
 
+# Upload filename extensions per MIME type. Google's upload pipeline
+# treats the extension as the file type signal (g4f issue #3064: an
+# extension-less or mismatched name shows as "unknown" and the model may
+# refuse the image), so the reported name must carry the right suffix.
+_MIME_EXT = {
+    "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp",
+    "image/gif": "gif", "image/bmp": "bmp", "image/tiff": "tiff",
+    "image/heic": "heic", "image/heif": "heic", "image/avif": "avif",
+}
+
+
 def _upload_one(data: bytes, mime: str):
     """Upload one image with the reference cache in front.
 
     Args:
         data: prepared image bytes.
-        mime: MIME type for the multipart part.
+        mime: MIME type for the multipart part; also picks the filename
+            extension reported to Google (see _MIME_EXT).
 
     Returns:
         UploadedFileRef (string-compatible, carries mime_type).
@@ -170,7 +182,8 @@ def _upload_one(data: bytes, mime: str):
     cached = _cache_get(key)
     if cached:
         return cached[0]
-    ref = upload_image(data, "image.png", mime or "image/png")
+    ext = _MIME_EXT.get(mime or "", "png")
+    ref = upload_image(data, f"image.{ext}", mime or "image/png")
     check_budget("image upload")
     file_ref = UploadedFileRef(ref, mime or "image/png")
     _cache_put(key, ref, mime or "image/png")

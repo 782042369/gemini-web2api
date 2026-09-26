@@ -179,6 +179,10 @@ class StreamingEndpointTests(unittest.TestCase):
         self.original_config = dict(CONFIG)
         CONFIG["api_keys"] = []
         CONFIG["log_requests"] = False
+        # Upload reference cache would otherwise leak identical images
+        # between tests and skip the mocked upload call entirely.
+        from gemini_web2api.server import images as server_images
+        server_images._ref_cache.clear()
 
     def tearDown(self):
         CONFIG.clear()
@@ -306,7 +310,7 @@ class StreamingEndpointTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         fetch_image_bytes.assert_called_once_with("https://example.com/image.jpg")
-        upload_image.assert_called_once_with(b"\xff\xd8\xffremote jpeg", "image.png", "image/jpeg")
+        upload_image.assert_called_once_with(b"\xff\xd8\xffremote jpeg", "image.jpg", "image/jpeg")
         self.assertEqual(generate.call_args.args[3], ["/uploaded/remote-ref"])
         self.assertIn("[Image attached]", generate.call_args.args[0])
 

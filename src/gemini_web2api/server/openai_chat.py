@@ -11,7 +11,6 @@ from ..tools import messages_to_prompt, parse_tool_calls
 from ..upstream import generate, generate_stream
 from ..upstream.parser import extract_response_text
 from ..vision_bridge import (
-    MAX_BRIDGE_IMAGE_BYTES,
     VisionBridgeError,
     fetch_page_tokens,
     vision_bridge_enabled,
@@ -73,7 +72,10 @@ class OpenAIChatMixin:
         except Exception:
             pass  # unreachable bridge: let the chain surface the real error
         try:
-            prepared = _normalize_images(images, byte_budget=MAX_BRIDGE_IMAGE_BYTES)
+            # Global byte cap: the hybrid bridge chain uploads server-side
+            # (no 4 MiB CDP limit); vision_generate re-fits to the bridge
+            # budget itself when it falls back to the in-page upload.
+            prepared = _normalize_images(images)
             sg_raw = vision_generate(prompt, prepared,
                                      model_id=model_id, think_mode=think_mode)
             text = extract_response_text(sg_raw)

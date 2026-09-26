@@ -239,6 +239,7 @@ def test_vision_generate_serializes_chains(monkeypatch):
 
     monkeypatch.setattr(vision_bridge, "_page_chain_js", lambda *a, **k: fake_js)
     monkeypatch.setattr(vision_bridge, "_run_page_chain", fake_chain)
+    monkeypatch.setattr(vision_bridge, "_server_upload_all", lambda p: None)
     monkeypatch.setattr("gemini_web2api.image_prep.prepare_image",
                         lambda data, mime, budget, **k: (data, mime))
 
@@ -268,6 +269,7 @@ def test_vision_generate_stale_session_reloads_and_retries(monkeypatch):
     monkeypatch.setattr(vision_bridge, "_run_page_chain", fake_chain)
     monkeypatch.setattr(vision_bridge, "_reload_gemini_tab",
                         lambda: calls.update(reload=1) or {"at": "AOvxNEW"})
+    monkeypatch.setattr(vision_bridge, "_server_upload_all", lambda p: None)
     monkeypatch.setattr("gemini_web2api.image_prep.prepare_image",
                         lambda data, mime, budget, **k: (data, mime))
     out = vision_bridge.vision_generate("p", [(b"img", "image/png")])
@@ -289,6 +291,7 @@ def test_vision_generate_bare_ref_fallback(monkeypatch):
 
     monkeypatch.setattr(vision_bridge, "_run_page_chain", fake_chain)
     monkeypatch.setattr(vision_bridge, "_reload_gemini_tab", lambda: {})
+    monkeypatch.setattr(vision_bridge, "_server_upload_all", lambda p: None)
     monkeypatch.setattr("gemini_web2api.image_prep.prepare_image",
                         lambda data, mime, budget, **k: (data, mime))
     out = vision_bridge.vision_generate("p", [(b"img", "image/jpeg")])
@@ -300,6 +303,7 @@ def test_vision_generate_busy_lock_times_out(monkeypatch):
     """A held bridge lock surfaces a busy error instead of queueing forever."""
     CONFIG["vision_bridge_url"] = "http://bridge:22"
     monkeypatch.setattr(vision_bridge, "_BRIDGE_CHAIN_WAIT", 0.05)
+    monkeypatch.setattr(vision_bridge, "_server_upload_all", lambda p: None)
     monkeypatch.setattr("gemini_web2api.image_prep.prepare_image",
                         lambda data, mime, budget, **k: (data, mime))
     acquired = vision_bridge._bridge_lock.acquire()
@@ -312,7 +316,7 @@ def test_vision_generate_busy_lock_times_out(monkeypatch):
 
 
 def test_keepalive_vision_ring_gated_and_fires(monkeypatch):
-    """The tab-reload ring only runs when configured, then reloads."""
+    """The keepalive ring skips reloads while at stays fresh (soft-first)."""
     from gemini_web2api import keepalive
     keepalive._vision_tab_last["ts"] = 0.0
     CONFIG["vision_bridge_url"] = "http://bridge:22"
@@ -321,7 +325,7 @@ def test_keepalive_vision_ring_gated_and_fires(monkeypatch):
         keepalive._maybe_keep_vision_tab()  # disabled: no-op
         CONFIG["vision_tab_keepalive_sec"] = 600
         reloaded = []
-        warmed = []
+        probed = []
         monkeypatch = pytest.MonkeyPatch()
         try:
             monkeypatch.setattr("gemini_web2api.vision_bridge.vision_bridge_enabled",
@@ -329,14 +333,116 @@ def test_keepalive_vision_ring_gated_and_fires(monkeypatch):
             monkeypatch.setattr("gemini_web2api.vision_bridge._reload_gemini_tab",
                                 lambda: reloaded.append(1) or {"at": "AOvx1"})
             monkeypatch.setattr("gemini_web2api.vision_bridge.fetch_page_tokens",
-                                lambda force=False: warmed.append(force) or {"at": "AOvx1"})
+                                lambda force=False: probed.append(force)
+                                or ({"at": "AOvx1"} if len(probed) == 1 else {}))
+            # Soft path: a live at means no reload at all.
             keepalive._maybe_keep_vision_tab()
-            assert reloaded == [1] and warmed == [True]
-            keepalive._maybe_keep_vision_tab()  # within interval: skipped
+            assert probed == [True] and reloaded == []
+            # Hard path: the next tick finds no at and reloads once.
+            keepalive._vision_tab_last["ts"] = 0.0
+            keepalive._maybe_keep_vision_tab()
             assert reloaded == [1]
+            keepalive._vision_tab_last["ts"] = 0.0
+            keepalive._maybe_keep_vision_tab()  # within interval skip via reset
         finally:
             monkeypatch.undo()
     finally:
         CONFIG["vision_tab_keepalive_sec"] = 0
         keepalive._vision_tab_last["ts"] = 0.0
+
+
+def test_page_chain_js_ref_payload_skips_upload():
+    """Hybrid payload entries carry refs and no base64 bytes."""
+    js = vision_bridge._page_chain_js(
+        "hi", [("/contrib_service/ttl_1d/abc", "image/jpeg")], 1, None)
+    assert '"ref": "/contrib_service/ttl_1d/abc"' in js
+    assert '"b64"' not in js
+    assert "push.clients6.google.com/upload" in js  # upload code kept for fallback
+
+
+def test_vision_generate_hybrid_uses_server_upload(monkeypatch):
+    """Server-side refs flow into the page chain when uploads succeed."""
+    CONFIG["vision_bridge_url"] = "http://bridge:22"
+    CONFIG["vision_bridge_server_upload"] = True
+    captured = []
+
+    def fake_chain_js(prompt, images, model_id, think_mode, allow_bare_ref=False):
+        """Record the chain images. Args: as _page_chain_js. Returns: str."""
+        captured.append(images)
+        return "js"
+
+    monkeypatch.setattr(vision_bridge, "_page_chain_js", fake_chain_js)
+    monkeypatch.setattr(vision_bridge, "_run_page_chain", lambda js: {"sg": "ok"})
+    monkeypatch.setattr(vision_bridge, "_server_upload_all",
+                        lambda p: [("/contrib_service/ttl_1d/x", m)
+                                   for _, m in p])
+    monkeypatch.setattr("gemini_web2api.image_prep.prepare_image",
+                        lambda data, mime, budget, **k: (data, mime))
+    out = vision_bridge.vision_generate("p", [(b"img", "image/jpeg")])
+    assert out == "ok"
+    assert captured == [[("/contrib_service/ttl_1d/x", "image/jpeg")]]
+
+
+def test_vision_generate_hybrid_falls_back_to_in_page(monkeypatch):
+    """A failed server upload falls back to the in-page base64 chain."""
+    CONFIG["vision_bridge_url"] = "http://bridge:22"
+    CONFIG["vision_bridge_server_upload"] = True
+    captured = []
+
+    def fake_chain_js(prompt, images, model_id, think_mode, allow_bare_ref=False):
+        """Record the chain images. Args: as _page_chain_js. Returns: str."""
+        captured.append(images)
+        return "js"
+
+    monkeypatch.setattr(vision_bridge, "_page_chain_js", fake_chain_js)
+    monkeypatch.setattr(vision_bridge, "_run_page_chain", lambda js: {"sg": "ok"})
+    monkeypatch.setattr(vision_bridge, "_server_upload_all", lambda p: None)
+    monkeypatch.setattr("gemini_web2api.image_prep.prepare_image",
+                        lambda data, mime, budget, **k: (data, mime))
+    out = vision_bridge.vision_generate("p", [(b"img", "image/jpeg")])
+    assert out == "ok"
+    assert captured == [[(b"img", "image/jpeg")]]
+
+
+def test_vision_generate_hybrid_disabled_by_config(monkeypatch):
+    """vision_bridge_server_upload=false restores the pure in-page chain."""
+    CONFIG["vision_bridge_url"] = "http://bridge:22"
+    CONFIG["vision_bridge_server_upload"] = False
+    captured = []
+
+    def fake_chain_js(prompt, images, model_id, think_mode, allow_bare_ref=False):
+        """Record the chain images. Args: as _page_chain_js. Returns: str."""
+        captured.append(images)
+        return "js"
+
+    def no_upload(prepared):
+        """Must never run while disabled. Args: prepared. Returns: refs."""
+        raise AssertionError("server upload ran while disabled")
+
+    monkeypatch.setattr(vision_bridge, "_page_chain_js", fake_chain_js)
+    monkeypatch.setattr(vision_bridge, "_run_page_chain", lambda js: {"sg": "ok"})
+    monkeypatch.setattr(vision_bridge, "_server_upload_all", no_upload)
+    monkeypatch.setattr("gemini_web2api.image_prep.prepare_image",
+                        lambda data, mime, budget, **k: (data, mime))
+    out = vision_bridge.vision_generate("p", [(b"img", "image/png")])
+    assert out == "ok"
+    assert captured == [[(b"img", "image/png")]]
+    CONFIG["vision_bridge_server_upload"] = True
+
+
+def test_upload_one_reports_correct_extension(monkeypatch):
+    """Server-side uploads name files with the MIME-matching extension."""
+    from gemini_web2api.server import images as server_images
+    names = []
+
+    def fake_upload(data, filename, mime):
+        """Record the reported filename. Args: per upload_image. Returns: ref."""
+        names.append(filename)
+        return "/contrib_service/ttl_1d/ref-" + str(len(names))
+
+    monkeypatch.setattr(server_images, "upload_image", fake_upload)
+    server_images._ref_cache.clear()
+    ref = server_images._upload_one(b"jpegbytes", "image/jpeg")
+    assert str(ref) == "/contrib_service/ttl_1d/ref-1"
+    assert names == ["image.jpg"]
 

@@ -15,6 +15,12 @@ Hardening (2026-09 research pass):
   automating the 2026-09-24 idle-tab incident class.
 - Images are preprocessed (downscale/re-encode) to fit the CDP evaluate
   payload limit instead of being rejected outright.
+- Hybrid chain (research round 2): images upload server-side on the
+  browser session (push_id borrowed from the page) and only ProcessFile
+  + StreamGenerate run in-page, shrinking the CDP evaluate payload from
+  base64 image bytes to plain reference strings and lifting the 4 MiB
+  evaluate ceiling; upload failures fall back to the in-page base64
+  chain re-fitted to the 4 MiB budget.
 - The requested model id and thinking level flow into the page payload
   (they were silently dropped before).
 """
@@ -133,7 +139,9 @@ def _page_chain_js(prompt: str, images: list,
 
     Args:
         prompt: user prompt text (already JSON-escaped by json.dumps).
-        images: list of (image_bytes, mime_type) tuples.
+        images: list of (image_bytes_or_ref, mime_type) tuples; a str
+            first element is a pre-uploaded /contrib_service reference
+            (hybrid chain) and skips the in-page upload step.
         model_id: optional MODE_CATEGORY id for inner[79] (1=FAST when
             omitted, the historical bridge behavior).
         think_mode: optional thinking level for inner[17] (0 = dynamic).
@@ -153,8 +161,11 @@ def _page_chain_js(prompt: str, images: list,
     """
     parts = []
     for data, mime in images:
-        b64 = base64.b64encode(data).decode()
-        parts.append({"b64": b64, "mime": mime})
+        if isinstance(data, str):  # pre-uploaded file reference (hybrid)
+            parts.append({"ref": data, "mime": mime})
+        else:
+            b64 = base64.b64encode(data).decode()
+            parts.append({"b64": b64, "mime": mime})
     payload = json.dumps({"prompt": prompt, "images": parts,
                           "model_id": model_id, "think_mode": think_mode,
                           "bare_ref": bool(allow_bare_ref)})
@@ -176,6 +187,10 @@ def _page_chain_js(prompt: str, images: list,
     for (var i = 0; i < PAYLOAD.images.length; i++) {
       var img = PAYLOAD.images[i];
       var name = 'image_' + (i + 1) + '.' + (EXT[img.mime] || 'png');
+      var ref;
+      if (img.ref) {
+        ref = img.ref;
+      } else {
       var bytes = Uint8Array.from(atob(img.b64), function (c) { return c.charCodeAt(0); });
       var r1 = await fetch('https://push.clients6.google.com/upload/', {
         method: 'POST',
@@ -196,8 +211,9 @@ def _page_chain_js(prompt: str, images: list,
                   'X-Goog-Upload-Offset': '0', 'X-Tenant-Id': 'bard-storage'},
         body: bytes
       });
-      var ref = (await r2.text()).trim();
+      ref = (await r2.text()).trim();
       if (ref.indexOf('/contrib') !== 0) return out({stage: 'upload', err: 'upload failed: ' + ref.slice(0, 80)});
+      }
       if (PAYLOAD.bare_ref) {
         entries.push([[ref, 1, null, img.mime], name]);
         continue;
@@ -347,6 +363,58 @@ def _reload_gemini_tab() -> dict:
     return {}
 
 
+def _hybrid_byte_cap() -> int:
+    """Resolve the global image byte cap for the hybrid bridge chain.
+
+    Args:
+        None.
+
+    Returns:
+        Positive byte cap from CONFIG["max_image_bytes"] (20 MiB when
+        unset or invalid).
+    """
+    try:
+        value = int(CONFIG.get("max_image_bytes") or 20 * 1024 * 1024)
+    except (TypeError, ValueError):
+        value = 20 * 1024 * 1024
+    return value
+
+
+def _server_upload_all(prepared: list) -> list:
+    """Upload every prepared image server-side for the hybrid chain.
+
+    Uses the shared browser session with the push_id borrowed from the
+    CDP page (via the cached page-token merge), so references land in
+    the signed-in account's bucket exactly like the in-page upload. The
+    shared reference cache in server.images dedupes multi-turn resends.
+
+    Args:
+        prepared: list of (image_bytes, mime_type) tuples.
+
+    Returns:
+        List of (ref_string, mime_type) tuples on full success, or None
+        when any image cannot be uploaded (caller falls back to the
+        in-page base64 chain).
+    """
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        from .server.images import _upload_one
+        # Parallel uploads (research: HanaokaYuzu asyncio.gather): the
+        # Scotty endpoints are independent per file; multi-image requests
+        # upload concurrently instead of serially.
+        if len(prepared) > 1:
+            with ThreadPoolExecutor(max_workers=min(4, len(prepared))) as pool:
+                refs = list(pool.map(
+                    lambda dm: (str(_upload_one(*dm)), dm[1]), prepared))
+        else:
+            refs = [(str(_upload_one(*prepared[0])), prepared[0][1])]
+        return refs
+    except Exception as e:
+        log(f"server-side upload for hybrid bridge chain failed ({e}); "
+            "falling back to in-page upload")
+        return None
+
+
 def vision_generate(prompt: str, images: list,
                     model_id: Optional[int] = None, think_mode: Optional[int] = None) -> str:
     """Generate a completion with images through the logged-in browser tab.
@@ -374,18 +442,36 @@ def vision_generate(prompt: str, images: list,
             mime = None
         if not data:
             raise VisionBridgeError("image fetch failed")
-        data, mime = prepare_image(data, mime or "image/png",
-                                   MAX_BRIDGE_IMAGE_BYTES)
-        if len(data) > MAX_BRIDGE_IMAGE_BYTES:
+        # Hybrid budget: the global cap; only the in-page base64 fallback
+        # below re-fits to MAX_BRIDGE_IMAGE_BYTES.
+        data, mime = prepare_image(data, mime or "image/png", _hybrid_byte_cap())
+        if len(data) > _hybrid_byte_cap():
             raise VisionBridgeError(
-                f"image exceeds bridge limit of {MAX_BRIDGE_IMAGE_BYTES} bytes")
+                f"image exceeds limit of {_hybrid_byte_cap()} bytes")
         prepared.append((data, mime))
 
     if not _bridge_lock.acquire(timeout=_BRIDGE_CHAIN_WAIT):
         raise VisionBridgeError(
             f"vision bridge busy: queued longer than {_BRIDGE_CHAIN_WAIT:.0f}s")
     try:
-        js = _page_chain_js(prompt, prepared, model_id, think_mode)
+        chain_images = prepared
+        if CONFIG.get("vision_bridge_server_upload") is not False:
+            refs = _server_upload_all(prepared)
+            if refs:
+                chain_images = refs  # hybrid: page chain skips uploads
+            else:
+                # In-page fallback carries base64 through the CDP evaluate
+                # payload; re-fit anything the looser hybrid budget allowed.
+                chain_images = []
+                for data, mime in prepared:
+                    data, mime = prepare_image(data, mime,
+                                               MAX_BRIDGE_IMAGE_BYTES)
+                    if len(data) > MAX_BRIDGE_IMAGE_BYTES:
+                        raise VisionBridgeError(
+                            "image exceeds bridge limit of "
+                            f"{MAX_BRIDGE_IMAGE_BYTES} bytes")
+                    chain_images.append((data, mime))
+        js = _page_chain_js(prompt, chain_images, model_id, think_mode)
         data = _run_page_chain(js)
         verdict = _classify_chain_failure(data) if data.get("err") else None
         if verdict == "stale_session":
@@ -403,7 +489,7 @@ def vision_generate(prompt: str, images: list,
             # does not exist in their protocol at all.
             log("ProcessFile unusable; retrying with bare references (no UUID)")
             data = _run_page_chain(
-                _page_chain_js(prompt, prepared, model_id, think_mode,
+                _page_chain_js(prompt, chain_images, model_id, think_mode,
                                allow_bare_ref=True))
         err = data.get("err")
         if err:
