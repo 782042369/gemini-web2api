@@ -39,5 +39,8 @@ logs/
 *.bak
 nohup.out
 
+# Debug HAR captures (contain live session credentials)
+*.har
+
 # Timestamped backups (missed by plain *.bak)
 *.bak-*
