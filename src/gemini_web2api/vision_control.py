@@ -51,37 +51,58 @@ def receive_cdp(ws, request_id, deadline):
             return msg
 
 
-def parallel_uploads(prepared, upload):
-    """Carry account and budget into workers. Args: images, upload callable. Returns: refs."""
+def parallel_map(items, fn):
+    """Map fn over items concurrently with account/budget context carried.
+
+    Worker threads reuse the caller's cookie account (path + auth_user)
+    and share the caller's request budget (deadline + cancellation), so
+    per-item work behaves exactly as if it ran on the caller thread.
+
+    Args:
+        items: list of work items forwarded to fn.
+        fn: callable(item) -> result; runs under the carried context.
+
+    Returns:
+        List of fn results in input order.
+
+    Raises:
+        The first failure in input order propagates unchanged;
+        RequestControlError propagates immediately.
+    """
     with budget_scope() as parent:
         path, auth_user = _active_cookie_path(), _active_auth_user()
         child = RequestBudget(deadline=parent.deadline, cancel_check=lambda: (
             parent.cancelled.is_set() or (parent.cancel_check is not None and parent.cancel_check())))
         def work(item):
-            """Bind and restore worker-local context. Args: image tuple. Returns: ref tuple."""
+            """Bind and restore worker-local context. Args: one item. Returns: fn result."""
             with budget_scope(child), use_cookie(path):
                 set_active_auth_user(auth_user)
-                ref = str(upload(*item))
-                check_budget('vision upload completion')
-                return ref, item[1]
-        pool = ThreadPoolExecutor(max_workers=min(4, len(prepared)))
+                result = fn(item)
+                check_budget('vision parallel work')
+                return result
+        pool = ThreadPoolExecutor(max_workers=min(4, len(items)))
         futures = []
         try:
-            futures = [pool.submit(work, item) for item in prepared]
-            refs = []
+            futures = [pool.submit(work, item) for item in items]
+            results = []
             for future in futures:
                 while True:
                     try:
-                        refs.append(future.result(timeout=min(0.1, parent.remaining('vision uploads'))))
+                        results.append(future.result(timeout=min(0.1, parent.remaining('vision parallel work'))))
                         break
                     except FutureTimeout:
                         if future.done():
                             raise
-            parent.check('vision uploads')
-            return refs
+            parent.check('vision parallel work')
+            return results
         finally:
             child.cancel()
             for future in futures:
                 future.cancel()
             # Never let executor shutdown extend an expired caller deadline.
             pool.shutdown(wait=False)
+
+
+def parallel_uploads(prepared, upload):
+    """Carry account and budget into workers. Args: images, upload callable. Returns: refs."""
+    return parallel_map(prepared, lambda item: (str(upload(*item)), item[1]))

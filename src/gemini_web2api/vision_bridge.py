@@ -474,8 +474,9 @@ def vision_generate(prompt: str, images: list,
     from .image_prep import prepare_image
 
     prepared = []
-    for data, mime in images:
+    for entry in images:
         check_budget("vision image preparation")
+        data, mime = entry[0], entry[1]  # tolerant of a trailing detail hint
         if isinstance(data, str):  # defensive: URL entries normalize first
             data = fetch_image_bytes(data)
             mime = None

@@ -524,7 +524,6 @@ def start_keepalive():
                     log(f"Keepalive tick: account={path} rotate={'ok' if ok else 'failed'}")
                 except Exception as e:
                     log(f"Keepalive loop error for {path}: {e}")
-            _maybe_keep_vision_tab()
 
     with _keepalive_lock:
         if _keepalive_on["started"]:
@@ -538,3 +537,51 @@ def start_keepalive():
         threading.Thread(target=_loop, daemon=True, name="session-keepalive").start()
         _keepalive_on["started"] = True
     log(f"Keepalive started: every {interval:.0f}s")
+
+
+_vision_tab_thread_on = {"started": False}
+_vision_tab_thread_lock = threading.Lock()
+
+
+def start_vision_tab_keepalive():
+    """Run the soft vision tab keepalive on its own daemon thread.
+
+    Research pass 4: the vision tab keepalive previously rode the cookie
+    keepalive loop, so keepalive_sec=0 silently disabled the only
+    protection against the documented idle-tab outage class
+    (2026-09-15/19/24). This starter runs the same soft-first ring
+    (_maybe_keep_vision_tab) on a dedicated thread whenever a vision
+    bridge is configured and vision_tab_keepalive_sec > 0, independent
+    of the cookie keepalive configuration.
+
+    Args:
+        None.
+
+    Returns:
+        None; disabled/invalid configurations leave startup retryable.
+    """
+    def _loop():
+        """Probe or reload the vision tab once per interval. Args: None. Returns: never."""
+        while True:
+            time.sleep(vision_interval)
+            _maybe_keep_vision_tab()
+
+    try:
+        vision_interval = float(CONFIG.get("vision_tab_keepalive_sec") or 0)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(vision_interval) or vision_interval <= 0:
+        return
+    try:
+        from . import vision_bridge
+        if not vision_bridge.vision_bridge_enabled():
+            return
+    except Exception:
+        return
+    with _vision_tab_thread_lock:
+        if _vision_tab_thread_on["started"]:
+            return
+        _vision_tab_thread_on["started"] = True
+        threading.Thread(target=_loop, daemon=True,
+                         name="vision-tab-keepalive").start()
+    log(f"Vision tab keepalive started: every {vision_interval:.0f}s (soft-first)")

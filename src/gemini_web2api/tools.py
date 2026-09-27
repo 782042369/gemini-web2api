@@ -93,6 +93,42 @@ def _image_from_url(url: str, mime: Optional[str] = None):
     return url, mime or "image/png"
 
 
+def _image_detail(*sources) -> Optional[str]:
+    """Extract an OpenAI-style detail hint from image part sources.
+
+    Args:
+        sources: dicts that may carry a "detail" field (the image_url
+            object and/or the part itself, covering both the chat
+            completions and the Responses input_image shapes).
+
+    Returns:
+        "low" or "high" when explicitly requested, else None.
+    """
+    for src in sources:
+        if isinstance(src, dict):
+            detail = src.get("detail")
+            if detail in ("low", "high"):
+                return detail
+    return None
+
+
+def _with_detail(image, detail: Optional[str]):
+    """Attach an optional detail hint to one normalized image tuple.
+
+    Args:
+        image: (data, mime) tuple from _image_from_url, or None.
+        detail: "low"/"high" hint or None.
+
+    Returns:
+        The unchanged 2-tuple when no usable hint exists; a
+        (data, mime, detail) 3-tuple otherwise. None passes through.
+    """
+    if image is None or detail not in ("low", "high"):
+        return image
+    data, mime = image[0], image[1]
+    return data, mime, detail
+
+
 def _image_from_part(part: dict):
     """Extract an image source from one chat content part.
 
@@ -100,20 +136,27 @@ def _image_from_part(part: dict):
         part: OpenAI-style content part dict.
 
     Returns:
-        Normalized image tuple (see _image_from_url), or None.
+        Normalized image tuple (see _image_from_url), optionally with a
+        trailing "low"/"high" detail hint, or None.
     """
     part_type = part.get("type")
     if part_type == "image_url":
         image_url = part.get("image_url", {})
         if isinstance(image_url, dict):
-            return _image_from_url(image_url.get("url"), image_url.get("mime_type"))
+            return _with_detail(
+                _image_from_url(image_url.get("url"), image_url.get("mime_type")),
+                _image_detail(image_url, part))
         return _image_from_url(image_url)
     if part_type in ("input_image", "image"):
         image_url = part.get("image_url") or part.get("url")
         if isinstance(image_url, dict):
-            return _image_from_url(image_url.get("url"), image_url.get("mime_type"))
+            return _with_detail(
+                _image_from_url(image_url.get("url"), image_url.get("mime_type")),
+                _image_detail(image_url, part))
         if image_url:
-            return _image_from_url(image_url, part.get("mime_type"))
+            return _with_detail(
+                _image_from_url(image_url, part.get("mime_type")),
+                _image_detail(part))
         image_data = part.get("data") or part.get("base64")
         if isinstance(image_data, str):
             mime = part.get("mime_type") or part.get("media_type") or "image/png"

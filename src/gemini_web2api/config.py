@@ -73,12 +73,13 @@ DEFAULT_CONFIG = {
     # Larger edges are LANCZOS-downsampled; 0 falls back to the default.
     # Keeps CDP evaluate payloads small and model token usage sane.
     "vision_max_edge_px": 2048,
-    # Vision tab keepalive ring: reload the CDP Gemini tab every N seconds
-    # to keep DBSC rotation and the page-level at token fresh during idle
-    # periods (root cause of the 2026-09-24 stale-session outage). 0=off;
-    # enable only with an explicit ops decision (each reload minted fresh
-    # tokens; a logged-out tab stays logged out and only logs a warning).
-    "vision_tab_keepalive_sec": 0,
+    # Vision tab keepalive ring (soft-first): probe the CDP Gemini tab's
+    # page tokens every N seconds and only reload the tab when the at
+    # token went stale (root cause of the 2026-09-24 idle-tab outage;
+    # the 09-15/09-19/09-24 incidents all traced to a stale/idle tab).
+    # The soft probe never reloads a healthy tab, so the default is on
+    # whenever a vision bridge is configured. 0 disables explicitly.
+    "vision_tab_keepalive_sec": 1800,
     # Hybrid bridge chain: upload images server-side (browser session with
     # the push_id borrowed from the CDP page) and run only ProcessFile +
     # StreamGenerate inside the page. Removes the 4 MiB CDP evaluate

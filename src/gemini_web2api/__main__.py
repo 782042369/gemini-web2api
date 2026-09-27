@@ -4,7 +4,7 @@ import os
 
 from . import __version__
 from .config import CONFIG, find_config, load_config
-from .keepalive import start_keepalive
+from .keepalive import start_keepalive, start_vision_tab_keepalive
 from .models import MODELS
 from .server import GeminiHandler, ThreadedServer
 from .upstream import HAS_CURL_CFFI, HAS_HTTPX, start_keep_warm
@@ -53,6 +53,7 @@ def main():
     print()
     start_keep_warm()
     start_keepalive()
+    start_vision_tab_keepalive()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

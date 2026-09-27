@@ -47,17 +47,85 @@ def _image_byte_cap() -> int:
     return value if value > 0 else 20 * 1024 * 1024
 
 
+# OpenAI detail hint -> long-edge pixel cap (research pass 4): "low"
+# trades fidelity for upload/evaluate speed (LiteLLM low-fidelity tier);
+# "high" keeps OCR-grade fidelity (Google Vision sweet spot 800-2000px,
+# tesseract ~300DPI / >=20px x-height). Absent detail keeps the global
+# vision_max_edge_px default.
+_DETAIL_EDGE = {"low": 1024, "high": 2048}
+
+
+def _prepare_entry(item: tuple, cap: int, max_bytes: int) -> tuple:
+    """Fetch, sniff and preprocess one raw image entry.
+
+    Args:
+        item: (bytes-or-url, mime) or (bytes-or-url, mime, detail)
+            tuple from the protocol layer.
+        cap: byte budget the prepared bytes must fit.
+        max_bytes: global hard byte cap applied to raw downloads.
+
+    Returns:
+        (image_bytes, mime_type) tuple.
+
+    Raises:
+        RuntimeError: when the image cannot be downloaded, decodes to
+            nothing, or exceeds the configured size cap.
+    """
+    check_budget("image processing")
+    if not (isinstance(item, tuple) and len(item) >= 2):
+        return None
+    data, mime = item[0], item[1]
+    detail = item[2] if len(item) > 2 else None
+    if isinstance(data, str):
+        data = fetch_image_bytes(data)
+        mime = None  # URL-declared types are unreliable; sniff instead
+    if not data:
+        raise RuntimeError("image fetch failed")
+    if len(data) > max_bytes:
+        raise RuntimeError(f"image exceeds {max_bytes} bytes")
+    mime = detect_image_mime(data, mime or "image/png")
+    data, mime = prepare_image(data, mime, min(cap, max_bytes),
+                               max_edge=_DETAIL_EDGE.get(detail))
+    if not data:
+        raise RuntimeError("image decode failed")
+    return data, mime
+
+
+def _parallel_prepare(images: list, cap: int, max_bytes: int) -> list:
+    """Prepare image entries concurrently, preserving order.
+
+    Args:
+        images: raw protocol-layer image tuples.
+        cap: byte budget passed to _prepare_entry.
+        max_bytes: global hard byte cap.
+
+    Returns:
+        List of (image_bytes, mime_type) tuples in input order.
+
+    Raises:
+        RuntimeError: the first failure (in input order) propagates;
+            RequestControlError propagates unchanged.
+    """
+    from ..vision_control import parallel_map
+    return parallel_map(images,
+                        lambda item: _prepare_entry(item, cap, max_bytes))
+
+
 def _normalize_images(images: list, *, byte_budget: Optional[int] = None) -> list:
     """Normalize raw image entries for either vision chain.
 
     Fetches http(s) URL entries, sniffs the real MIME type from magic
     bytes and runs the preprocessing pipeline (EXIF rotation, long-edge
-    cap, transcode, budget re-encode) so both chains receive validated
-    (bytes, mime) tuples that already fit their transport limits.
+    cap - optionally per-image via an OpenAI "detail" hint - transcode,
+    budget re-encode) so both chains receive validated (bytes, mime)
+    tuples that already fit their transport limits. Entries are prepared
+    concurrently when several images are supplied (URL downloads and
+    encodes dominate the latency; research pass 4).
 
     Args:
-        images: list of (bytes-or-url, mime) tuples from the protocol
-            layer (see tools.messages_to_prompt).
+        images: list of (bytes-or-url, mime) or (bytes-or-url, mime,
+            detail) tuples from the protocol layer (see
+            tools.messages_to_prompt).
         byte_budget: optional byte cap the prepared bytes must fit
             (defaults to the global image cap).
 
@@ -69,25 +137,16 @@ def _normalize_images(images: list, *, byte_budget: Optional[int] = None) -> lis
             nothing, or exceeds the configured size cap.
     """
     cap = byte_budget or _image_byte_cap()
+    max_bytes = _image_byte_cap()
+    items = [item for item in images
+             if isinstance(item, tuple) and len(item) >= 2]
+    if len(items) > 1:
+        return _parallel_prepare(items, cap, max_bytes)
     prepared = []
-    for item in images:
-        check_budget("image processing")
-        if not (isinstance(item, tuple) and len(item) == 2):
-            continue
-        data, mime = item
-        if isinstance(data, str):
-            data = fetch_image_bytes(data)
-            mime = None  # URL-declared types are unreliable; sniff instead
-        if not data:
-            raise RuntimeError("image fetch failed")
-        max_bytes = _image_byte_cap()
-        if len(data) > max_bytes:
-            raise RuntimeError(f"image exceeds {max_bytes} bytes")
-        mime = detect_image_mime(data, mime or "image/png")
-        data, mime = prepare_image(data, mime, min(cap, max_bytes))
-        if not data:
-            raise RuntimeError("image decode failed")
-        prepared.append((data, mime))
+    for item in items:
+        entry = _prepare_entry(item, cap, max_bytes)
+        if entry is not None:
+            prepared.append(entry)
     return prepared
 
 
@@ -219,13 +278,20 @@ def _upload_images(images: list) -> list:
     if not images:
         return None
     prepared = _normalize_images(images)
-    file_refs = []
-    for data, mime in prepared:
-        try:
-            file_refs.append(_upload_one(data, mime))
-        except RequestControlError:
-            raise
-        except Exception as e:
-            check_budget("image upload")
-            raise RuntimeError(f"image upload failed: {e}") from e
-    return file_refs if file_refs else None
+    if not prepared:
+        return None
+    try:
+        if len(prepared) > 1:
+            # Concurrent uploads (research pass 4): the bridge chain
+            # already parallelizes; the direct chain gets the same
+            # treatment. Results keep UploadedFileRef semantics.
+            from ..vision_control import parallel_map
+            return parallel_map(prepared,
+                                lambda item: _upload_one(item[0], item[1]))
+        ref = _upload_one(*prepared[0])
+    except RequestControlError:
+        raise
+    except Exception as e:
+        check_budget("image upload")
+        raise RuntimeError(f"image upload failed: {e}") from e
+    return [ref]
