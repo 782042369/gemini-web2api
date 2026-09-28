@@ -44,3 +44,4 @@ nohup.out
 
 # Timestamped backups (missed by plain *.bak)
 *.bak-*
+logs-green/

@@ -196,8 +196,15 @@ def _page_chain_js(prompt: str, images: list,
       return m ? m[1] : null;
     }
     var at = wiz('SNlM0e'), fsid = wiz('FdrFJe'), bl = wiz('cfb2h');
-    var pushId = wiz('qKIAYe'), pctx = wiz('Ylro7b');
-    if (!at || !pushId) return out({stage: 'session', err: 'session not ready (no at/push_id; logged in?)'});
+    // Research round 5: the reference clients keep a hardcoded fallback
+    // push id (g4f UPLOAD_IMAGE_HEADERS, still accepted 2026) and send an
+    // empty at when SNlM0e is absent (HanaokaYuzu PR #247, v1.20.0). A
+    // missing at therefore downgrades to the bare-reference no-UUID chain
+    // instead of failing the request outright.
+    var pushId = wiz('qKIAYe') || 'feeds/mcudyrk2a4khkz', pctx = wiz('Ylro7b');
+    var atless = !at;
+    if (atless) at = '';
+    if (!bl) return out({stage: 'session', err: 'session not ready (no build label; logged in?)'});
     var entries = [];
     var EXT = {'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp',
                'image/gif': 'gif', 'image/bmp': 'bmp',
@@ -232,8 +239,11 @@ def _page_chain_js(prompt: str, images: list,
       ref = (await r2.text()).trim();
       if (ref.indexOf('/contrib') !== 0) return out({stage: 'upload', err: 'upload failed: ' + ref.slice(0, 80)});
       }
-      if (PAYLOAD.bare_ref) {
-        entries.push([[ref, 1, null, img.mime], name]);
+      if (PAYLOAD.bare_ref || atless) {
+        // atless uses the current reference-client form [[ref], name]
+        // (HanaokaYuzu client.py file_data); the explicit bare_ref
+        // fallback keeps the HAR-observed [ref, 1, null, mime] shape.
+        entries.push(atless ? [[ref], name] : [[ref, 1, null, img.mime], name]);
         continue;
       }
       var pfInner = [[[ref, null, 1, img.mime], name], null, 1, ['zh-CN']];
@@ -259,23 +269,31 @@ def _page_chain_js(prompt: str, images: list,
     inner[1] = ['zh-CN']; inner[6] = [0]; inner[7] = 1; inner[10] = 1; inner[11] = 0;
     inner[17] = [[PAYLOAD.think_mode == null ? 0 : PAYLOAD.think_mode]];
     inner[18] = 0; inner[27] = 1; inner[30] = [4]; inner[41] = [2];
-    inner[53] = 0; inner[59] = 'BRDG' + Date.now().toString(16).toUpperCase() + '-4A01-4C22-9F61A7E89B01';
-    inner[61] = []; inner[68] = 1;
+    inner[53] = 0; inner[61] = []; inner[68] = 1;
     inner[79] = PAYLOAD.model_id == null ? 1 : PAYLOAD.model_id;
+    // Research round 5 payload alignment (HanaokaYuzu master inner_req_list):
+    // [80] carries the thinking tier (2 extended / 1 standard) and the
+    // request uuid is mirrored into the x-goog-ext-525005358-jspb header.
+    var reqUuid = (self.crypto && crypto.randomUUID)
+      ? crypto.randomUUID().toUpperCase()
+      : 'BRDG' + Date.now().toString(16).toUpperCase() + '-4A01-4C22-9F61A7E89B01';
+    inner[59] = reqUuid;
+    inner[80] = (PAYLOAD.think_mode == null ? 0 : PAYLOAD.think_mode) > 0 ? 2 : 1;
     var params = new URLSearchParams();
     params.set('f.req', JSON.stringify([null, JSON.stringify(inner)]));
     params.set('at', at);
     var sgUrl = 'https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl='
       + encodeURIComponent(bl) + '&hl=zh&_reqid=' + (Date.now() %% 1000000) + '&rt=c&f.sid=' + fsid;
     var r4 = await fetch(sgUrl, {method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded', 'X-Same-Domain': '1'},
+      headers: {'Content-Type': 'application/x-www-form-urlencoded', 'X-Same-Domain': '1',
+                'x-goog-ext-525005358-jspb': JSON.stringify([reqUuid, 1])},
       body: params.toString()});
     var sgText = await r4.text();
     if (sgText.indexOf('BardErrorInfo') >= 0) {
       var em = sgText.match(/BardErrorInfo[^0-9]*(\\d+)/);
       return out({stage: 'generate', err: 'upstream rejected: ' + (em ? em[1] : 'unknown')});
     }
-    return out({sg: sgText});
+    return out({sg: sgText, atless: atless});
   } catch (e) {
     return out({stage: 'exception', err: 'chain exception: ' + String(e).slice(0, 150)});
   }
@@ -550,7 +568,8 @@ def vision_generate(prompt: str, images: list,
         sg = data.get("sg")
         if not sg:
             raise VisionBridgeError("bridge chain returned no generation")
-        log("vision bridge chain ok (%d bytes)" % len(sg))
+        log("vision bridge chain ok (%d bytes%s)" % (
+            len(sg), ", atless rescue" if data.get("atless") else ""))
         return sg
     finally:
         _bridge_lock.release()
@@ -567,6 +586,31 @@ def vision_generate(prompt: str, images: list,
 # a tab whose renderer stopped answering is replaced with a freshly
 # created one and the corpse is closed. Successes and failures are both
 # cached so callers never hammer the browser.
+
+# Soft activity heartbeat (research round 5, HanaokaYuzu _sync_activity):
+# one lightweight batchexecute RPC (read user preferences with the
+# "bard_activity_enabled" flag) executed inside the logged-in tab. It
+# tells the backend the session is active without reloading the page -
+# the activity signal the reference client sends before every upload
+# and generate, and a softer keepalive than any reload.
+_ACTIVITY_JS = (
+    '(async function(){'
+    'var s=document.documentElement.innerHTML;'
+    "function wiz(k){var m=s.match(new RegExp('\"' + k + '\":\"([^\"]+)\"'));}"
+    'return m?m[1]:null}'
+    "var at=wiz('SNlM0e'), bl=wiz('cfb2h');"
+    'if(!at) return JSON.stringify({ok:false, why:"no-at"});'
+    'var inner=[[["bard_activity_enabled"]]];'
+    'var freq=[[["ESY5D", JSON.stringify(inner), null, "generic"]]];'
+    'var params=new URLSearchParams();'
+    'params.set("f.req", JSON.stringify(freq));'
+    'params.set("at", at);'
+    'var r=await fetch("https://gemini.google.com/_/BardChatUi/data/batchexecute?bl="'
+    ' + encodeURIComponent(bl), {method:"POST",'
+    ' headers:{"Content-Type":"application/x-www-form-urlencoded","X-Same-Domain":"1"},'
+    ' body:params.toString()});'
+    'return JSON.stringify({ok: r.status === 200, status: r.status});})()'
+)
 
 _TOKEN_JS = (
     '(function(){var s=document.documentElement.innerHTML;'
@@ -721,6 +765,33 @@ def _open_fresh_gemini_tab() -> dict:
                 return tab
         bridge_sleep(1)
     raise VisionBridgeError("fresh Gemini tab did not navigate")
+
+
+def page_activity_ping() -> dict:
+    """Run one soft session-activity RPC inside the logged-in tab.
+
+    Mirrors HanaokaYuzu _sync_activity (a read-user-preferences
+    batchexecute carrying the bard_activity_enabled flag) so the backend
+    keeps treating the tab's session - and its page-level at token - as
+    active. Soft by design: never reloads, never raises.
+
+    Args:
+        None.
+
+    Returns:
+        {"ok": bool, ...} from the page; {"ok": False} on any failure.
+    """
+    try:
+        check_budget("vision activity ping")
+        tab = _find_gemini_tab()
+        raw = _tab_evaluate(tab, _ACTIVITY_JS, _BRIDGE_EVAL_TIMEOUT)
+        if isinstance(raw, str) and raw.startswith("{"):
+            return json.loads(raw)
+    except RequestControlError:
+        raise
+    except Exception as exc:
+        log(f"vision activity ping skipped ({exc})")
+    return {"ok": False}
 
 
 def _map_page_tokens(raw) -> dict:

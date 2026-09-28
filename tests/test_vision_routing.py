@@ -220,7 +220,7 @@ def test_page_chain_js_carries_model_and_extensions():
     assert "'jpg'" in js and "'webp'" in js
     bare = vision_bridge._page_chain_js("hi", [(b"a", "image/png")], 1, None, True)
     assert '"bare_ref": true' in bare
-    assert 'if (PAYLOAD.bare_ref)' in bare
+    assert 'PAYLOAD.bare_ref || atless' in bare  # round 5: at-less auto path
 
 
 def test_vision_generate_serializes_chains(monkeypatch):

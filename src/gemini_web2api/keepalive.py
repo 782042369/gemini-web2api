@@ -214,7 +214,13 @@ def _maybe_keep_vision_tab():
             return
         tokens = vision_bridge.fetch_page_tokens(force=True)
         if tokens.get("at"):
-            log("vision tab keepalive: at fresh (soft probe, no reload)")
+            # Research round 5: additionally send the reference client's
+            # soft activity RPC so the backend session - not just the page
+            # - stays active (HanaokaYuzu _sync_activity before every
+            # upload/generate); guards the 2026-09-24 at-expiry class.
+            ping = vision_bridge.page_activity_ping()
+            log("vision tab keepalive: at fresh (soft probe%s, no reload)"
+                % (", activity ok" if ping.get("ok") else ""))
             return
         tokens = vision_bridge._reload_gemini_tab()
         if tokens.get("at"):

@@ -106,3 +106,28 @@ asyncio.gather | vision_bridge.py _server_upload_all | HanaokaYuzu client.py:120
 上传扩展名；改写保活环测试为软优先语义）。
 - 三次断链的另两项防复发（A：CDP Chrome+socat 纳入 seat supervisor；C：at 缺失
   告警）属宿主机/监控层变更，不在本仓库代码范围。
+
+
+## 六、第五轮调研与优化（2026-09-28）
+
+新一轮全网核实（HanaokaYuzu master 逐行对照 + PR #247 细节 + g4f 2026 provider 现状）发现
+四项前四轮未覆盖的差距，全部落地：
+
+| # | 发现（来源） | 实施 |
+|---|---|---|
+| 18 | **at 可为空串**：[PR #247](https://github.com/HanaokaYuzu/Gemini-API/pull/247)（v1.20.0, 2026-03）实测 batchexecute 在 at="" 下仍可基本生成——SNlM0e 从页面消失不再等于全链失败 | 页面链 at 缺失时自动降级：at="" + 参考客户端裸附件形态 [[ref], name]（跳过 ProcessFile），成功日志带 "atless rescue" 标记。直接覆盖 09-24「reload 后停发 SNlM0e」事故类的最后救援面 |
+| 19 | **兜底 push id**：g4f 至今硬编码 feeds/mcudyrk2a4khkz（2026-05 build 下仍被接受），仅作 qKIAYe 缺失时的 fallback | 页面链 push_id 缺失不再硬失败，使用常量兜底；session 硬门槛改为只查 bl（构建标签） |
+| 20 | **payload 演进**：参考客户端新增 inner[80]（思考档 2=extended/1=standard）与请求头 x-goog-ext-525005358-jspb: ["uuid",1]（uuid 与 inner[59] 同源；issue #254 佐证） | 页面链补齐 inner[80]（按 think_mode 映射）与 jspb 头（crypto.randomUUID，降级旧 BRDG 格式） |
+| 21 | **_sync_activity 软心跳**：参考客户端在每次上传/生成前发 read-user-preferences batchexecute（bard_activity_enabled）向服务端声明会话活跃——比任何 reload 都软 | vision_bridge.page_activity_ping()：保活环在 at 新鲜探测后于页面内执行同一 RPC（ESY5D），失败仅记日志；从「维持页面」升级为「维持服务端会话」，针对 at 过期根因 |
+
+附件形态对照：HanaokaYuzu 现行 [[url], filename]（本轮 at-less 路径采用）；本项目 HAR 实证
+[ref, 1, null, mime, UUID]（ProcessFile 主路径保留）；裸 ref 回退 [ref, 1, null, mime]
+（保留）。inner[6]/inner[41] 两版社区实现不一致（[0]/[1]、[2]/[1] 各有出处），维持现状不改。
+
+### 未做（记录取舍）
+
+- 官方 files API 混合架构：需要 API key，超出本项目「逆向网页」范围。
+- 服务端 ProcessFile（09-08 已实证被拒）维持不做。
+
+测试：新增 tests/test_vision_round5.py 7 项（at-less 形态、兜底 push id、payload 新字段、
+裸 ref 形态不回退、心跳 JS/软失败、保活环接线），全套 870 项通过。

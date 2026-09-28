@@ -6,6 +6,16 @@ semver.
 
 ## [Unreleased]
 
+### Vision research pass 5 (2026-09-28)
+
+Round-5 web research (HanaokaYuzu master incl. PR #247, g4f 2026 provider state) applied to the bridge chain; details in docs/VISION_RESEARCH.md round 5.
+
+- At-less rescue chain: when the page carries no SNlM0e (the 2026-09-24 idle-tab incident class), the in-page chain now degrades to empty-string at + reference-client bare attachments ([[ref], name], no ProcessFile) instead of hard-failing "session not ready"; successful rescues log an "atless rescue" marker.
+- Fallback push id "feeds/mcudyrk2a4khkz" (g4f default, still accepted 2026) when the page omits qKIAYe, so uploads no longer abort on a missing push id alone.
+- Payload alignment with the current reference client: inner[80] thinking tier (2 extended / 1 standard) and the x-goog-ext-525005358-jspb header mirroring a real per-request uuid (inner[59]).
+- Soft activity heartbeat: the vision tab keepalive now also runs the reference client's _sync_activity batchexecute (ESY5D / bard_activity_enabled) inside the tab after a fresh at probe, keeping the backend session active without reloads; failures are logged and non-fatal.
+- 7 new offline regressions (tests/test_vision_round5.py); suite now 870 tests, all green.
+
 ### Translation isolation and vision request controls
 
 - Remove query values from non-POST access logs, including parser errors; retain method, safe path and status.
